@@ -18,7 +18,7 @@ Retenixa 是一个本地运行的 MCP 项目记忆服务。它把任务进度、
 
 ## 快速开始
 
-当前构建与验证平台为 **Windows x86_64**。安装 Rust（工具链由仓库固定为 1.95.0）、MSVC C/C++ Build Tools 和 Git 后，在仓库根目录运行：
+当前构建与验证平台为 **Windows x86_64**。发布后可从 [GitHub Releases](https://github.com/MUKAPP/Retenixa/releases) 下载 Windows 核心压缩包，解压后运行 `retenixa.exe`。如需从源码构建，安装 Rust（工具链由仓库固定为 1.95.0）、MSVC C/C++ Build Tools 和 Git 后，在仓库根目录运行：
 
 ~~~bash
 cargo build --release --locked
@@ -54,7 +54,7 @@ cargo build --release --locked
 
 DSH 用户可安装仓库中的 [适配插件](adapters/dsh/README.md)。它会自行启动 Retenixa，并替 Agent 管理持久工作流绑定、请求 ID 和结果未知的原始请求；合法重启可以续接原工作流。
 
-在 DSH 插件管理器中安装 adapters/dsh 的本地绝对路径或打包后的 tgz，然后填写：
+npm 首发后，可在 DSH 插件管理器中按包名 `@retenixa/dsh-adapter` 安装。也可使用 GitHub Release 的插件 `.tgz` 或从源码打包。安装后填写：
 
 | 字段 | 内容 |
 | --- | --- |
@@ -218,3 +218,15 @@ node scripts/verify-core.mjs .
 Rust 集成测试需要支持 git worktree add --orphan 的 Git。跨进程验收还需要 Node.js，并使用 target 下的独立合成目录；它检查真实 stdio 进程的任务认领、转交和备份恢复。
 
 DSH 隔离验收的宿主依赖与调用方式见 [适配插件说明](adapters/dsh/README.md)。
+
+## 发布
+
+[发布工作流](.github/workflows/release.yml) 沿用 CodeBridge 的稳定版本标签流程：更新 [DSH 插件版本](adapters/dsh/package.json)，将变更合入 `main`，再为该提交创建并推送 `vX.Y.Z` 标签。标签必须与插件版本完全一致；只修改版本或推送 `main` 不会发版。核心有独立版本；只在需要发布新核心版本时更新 [Cargo.toml](Cargo.toml) 和 [Cargo.lock](Cargo.lock)。如需通过这套流程分发新核心，也要更新插件版本并使用新标签。
+
+CI 测试并构建 Windows x64 核心，生成带核心版本号的 ZIP，再打包 DSH 插件。GitHub Release 附上两个文件；npm 只发布同一份插件 `.tgz`。两端独立发布，可在 Actions 中分别查看结果。
+
+### npm 首次接入
+
+1. 在 npm 创建或取得 `retenixa` 组织的发布权限。包尚未创建时，先由有权限的账号手动发布一次实际插件包：`npm publish ./retenixa-dsh-adapter-X.Y.Z.tgz --access public --ignore-scripts`。可以使用首个 GitHub Release 里的 `.tgz`；建立信任前，该次 Actions 的 npm 发布任务会失败，不影响 GitHub 附件。
+2. 确保发布工作流已合入远端，在该 npm 包的 Settings → Trusted publishing 中添加 GitHub Actions：用户 `MUKAPP`、仓库 `Retenixa`、工作流文件 `release.yml`、环境留空，并允许 `npm publish`。也可使用 npm 11.15.0 及以上运行 `npm trust github @retenixa/dsh-adapter --repo MUKAPP/Retenixa --file release.yml --allow-publish`，在 npm 页面完成账号验证。
+3. 建立信任后，在 npm 规定的两天内推送**下一个尚未发布的插件版本**标签，完成首次 OIDC 发布并绑定仓库。已手动发布的版本无需重跑 npm 任务；后续自动发布不需要配置 `NPM_TOKEN`。详见 [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)。

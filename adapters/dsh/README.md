@@ -4,7 +4,7 @@
 
 ## 安装与设置
 
-在 DSH 插件管理器中安装本地包目录或打包后的 tgz，可使用绝对路径或 file: 前缀。本包仍为 private，不提供 npm 注册表发布地址。
+npm 首发后，可在 DSH 插件管理器中按包名 `@retenixa/dsh-adapter` 安装。也可从 [GitHub Releases](https://github.com/MUKAPP/Retenixa/releases) 下载插件 `.tgz`，或安装本地包目录；本地安装使用绝对路径或 `file:` 前缀。插件不包含核心可执行文件，请另行下载或构建。
 
 在仓库根目录打包（目标目录须先存在，不执行安装脚本）：
 

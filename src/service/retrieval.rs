@@ -108,6 +108,106 @@ fn render(h: &Hit, query: &str, method: &str, conditions: &[Text], path: Option<
     json!({"id":h.id,"kind":h.kind,"entity_id":h.entity,"revision":h.revision,"task_id":h.task,"workspace_id":h.workspace,"key":h.key,"status":h.status,"conditions":h.conditions,"paths":h.paths,"applicability":applicability,"snippet":snippet(&h.text,query),"evidence_refs":evidence,"full_record":pointer,"reference_candidate":selection,"search_method":method,"attempt":if h.kind=="attempts"{json!({"goal":snippet(h.body["attempt"]["goal"].as_str().unwrap_or(""),query),"method":snippet(h.body["attempt"]["method"].as_str().unwrap_or(""),query),"result":snippet(h.body["attempt"]["result"].as_str().unwrap_or(""),query),"reason":h.body["attempt"]["reason"],"state":h.body["attempt"]["state"]})}else{Value::Null}})
 }
 impl Service {
+    pub(super) fn related_knowledge(
+        &self,
+        context: &str,
+        a: &Access,
+        snapshot: &CheckpointSnapshot,
+        pins: &[KnowledgeReference],
+        limit: usize,
+    ) -> Result<(Vec<RelatedKnowledge>, bool)> {
+        let mut paths = std::collections::BTreeSet::new();
+        for path in snapshot
+            .workspace
+            .related_files
+            .iter()
+            .filter_map(|file| prefix(&file.path.0).ok())
+        {
+            paths.extend(path.match_indices('/').map(|(at, _)| path[..at].to_owned()));
+            paths.insert(path);
+        }
+        let blockers = snapshot
+            .blockers
+            .iter()
+            .take(4)
+            .map(|s| s.0.chars().take(100).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let terms = search::fts_query(&blockers);
+        if paths.is_empty() && pins.is_empty() && terms.is_none() {
+            return Ok((Vec::new(), false));
+        }
+        let mut conn = self.store.connect()?;
+        let tx = conn.transaction()?;
+        self.access(&tx, context, false)?;
+        let sql = r#"
+            WITH observed(path) AS MATERIALIZED (SELECT value FROM json_each(:paths)),
+            pinned(id) AS MATERIALIZED (SELECT value FROM json_each(:pins)),
+            fixed_scope(path) AS MATERIALIZED (
+                SELECT DISTINCT p.path FROM pinned
+                JOIN search_documents d ON d.project_id=:project AND d.doc_id=pinned.id
+                JOIN search_document_paths p ON p.row_id=d.row_id
+            ),
+            observed_hits(row_id) AS MATERIALIZED (
+                SELECT DISTINCT p.row_id FROM observed JOIN search_document_paths p ON p.path=observed.path
+            ),
+            fixed_hits(row_id) AS MATERIALIZED (
+                SELECT DISTINCT p.row_id FROM fixed_scope JOIN search_document_paths p ON p.path=fixed_scope.path
+            ),
+            blocker_hits AS MATERIALIZED (
+                SELECT rowid,bm25(search_fts) AS score FROM search_fts
+                WHERE :terms IS NOT NULL AND search_fts MATCH coalesce(:terms, '"retenixa_no_terms"')
+            ),
+            candidates(row_id) AS (
+                SELECT row_id FROM observed_hits UNION SELECT row_id FROM fixed_hits UNION SELECT rowid FROM blocker_hits
+            )
+            SELECT d.entity_id,d.revision,d.key,substr(v.claim,1,100),
+                CASE WHEN o.row_id IS NOT NULL THEN 0 WHEN f.row_id IS NOT NULL THEN 1 ELSE 2 END AS priority,
+                d.conditions_json='[]'
+                    AND (d.workspace_id IS NULL OR d.workspace_id=:current_workspace)
+                    AND ((o.row_id IS NOT NULL AND :saved_workspace=:current_workspace)
+                        OR NOT EXISTS(SELECT 1 FROM search_document_paths p WHERE p.row_id=d.row_id))
+                    AS applicable
+            FROM candidates c JOIN search_documents d ON d.row_id=c.row_id
+            JOIN knowledge k ON k.project_id=d.project_id AND k.id=d.entity_id AND k.current_revision=d.revision AND k.status='active'
+            JOIN knowledge_revisions v ON v.project_id=k.project_id AND v.id=k.id AND v.revision=k.current_revision
+            LEFT JOIN observed_hits o ON o.row_id=c.row_id
+            LEFT JOIN fixed_hits f ON f.row_id=c.row_id
+            LEFT JOIN blocker_hits b ON b.rowid=c.row_id
+            WHERE d.project_id=:project AND d.kind='knowledge' AND v.claim IS NOT NULL
+                AND (d.workspace_id IS NULL OR d.workspace_id=:saved_workspace OR d.workspace_id=:current_workspace)
+                AND d.entity_id NOT IN (SELECT id FROM pinned)
+            ORDER BY priority, applicable DESC, coalesce(b.score,0), d.entity_id LIMIT :limit
+        "#;
+        let mut hits = {
+            let mut stmt = tx.prepare(sql)?;
+            stmt.query_map(rusqlite::named_params! {
+                ":paths": serde_json::to_string(&paths)?,
+                ":pins": serde_json::to_string(&pins.iter().map(|p| &p.knowledge_id).collect::<Vec<_>>())?,
+                ":project": a.project,
+                ":saved_workspace": snapshot.workspace.workspace_id.0,
+                ":current_workspace": a.workspace,
+                ":terms": terms,
+                ":limit": limit as i64 + 1,
+            }, |r| Ok(RelatedKnowledge {
+                id: Identifier(r.get(0)?),
+                revision: Revision(r.get(1)?),
+                key: Identifier(r.get(2)?),
+                excerpt: r.get(3)?,
+                match_reason: Text(match r.get::<_, i64>(4)? {
+                    0 => "适用路径覆盖检查点中的观测文件",
+                    1 => "与固定知识的路径范围相同",
+                    _ => "命中检查点记录的阻塞项",
+                }.into()),
+                applicability: if r.get::<_, bool>(5)? { Applicability::Match } else { Applicability::NeedsReview },
+            }))?.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        let more = hits.len() > limit;
+        hits.truncate(limit);
+        Ok((hits, more))
+    }
+
     pub(super) fn memory_search(&self, mut input: MemorySearchInput) -> Result<Value> {
         if input.query.trim().is_empty()
             || input.query.chars().count() > 4096

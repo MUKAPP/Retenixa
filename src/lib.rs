@@ -5,6 +5,7 @@ pub mod error;
 pub mod maintenance;
 pub mod mcp;
 pub mod permissions;
+mod process_identity;
 pub mod project;
 pub mod project_merge;
 pub mod search;

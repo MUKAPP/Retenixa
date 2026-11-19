@@ -6,6 +6,7 @@ use retenixa::{
     storage::Store,
 };
 use rmcp::ServiceExt;
+use std::io::{IsTerminal, Write};
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -78,7 +79,7 @@ async fn run() -> AppResult<()> {
                 )?)?
             );
         }
-        Command::Transfer {
+        Command::TransferFile {
             request_file,
             confirmed,
         } => {
@@ -88,6 +89,33 @@ async fn run() -> AppResult<()> {
             println!(
                 "{}",
                 maintenance::transfer(&Store::open(&config.data_dir)?, input, confirmed)?
+            );
+        }
+        Command::TransferInteractive {
+            project,
+            task,
+            target,
+            reason,
+        } => {
+            if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+                return Err(
+                    "交互转交需要终端；非交互请使用 --request-file --confirm-transfer".into(),
+                );
+            }
+            let (input, summary) =
+                maintenance::preview_transfer(&config.data_dir, project, task, target, reason)?;
+            eprintln!("转交预览：\n{}", serde_json::to_string_pretty(&summary)?);
+            eprint!("确认转交？输入 yes 后按回车：[yes/N] ");
+            std::io::stderr().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if answer.trim() != "yes" {
+                eprintln!("已取消转交。");
+                return Ok(());
+            }
+            println!(
+                "{}",
+                maintenance::transfer(&Store::open(&config.data_dir)?, input, true)?
             );
         }
         Command::Help => println!(
@@ -103,6 +131,7 @@ async fn run() -> AppResult<()> {
              \x20 project-merge  离线项目整合：--request-file <绝对路径>，默认只读预演；--confirm-project-merge 执行备份与事务整合\n\
              \x20 reindex    重建派生检索索引\n\
              \x20 transfer   管理转交：--request-file <管理请求 JSON 绝对路径> --confirm-transfer\n\
+             \x20            终端确认：--project <项目 ID> --task <任务 ID> --to <目标 workflow ID> --reason <原因>\n\
              \x20 host-init  建立宿主私有绑定：--binding-file <绝对路径> --host <宿主> --host-session <可信会话 ID>\n\
              \n\
              通用选项：--data-dir <绝对路径>，省略时使用 %LOCALAPPDATA%/Retenixa\n\

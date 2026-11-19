@@ -221,12 +221,23 @@ pub struct ContextOpenOutput {
     pub requires_reattach: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeView {
+    Compact,
+    #[default]
+    Standard,
+    Full,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextResumeInput {
     pub context_id: Identifier,
     pub task_id: Identifier,
     pub checkpoint_id: Option<Identifier>,
+    #[serde(default)]
+    pub view: ResumeView,
     #[schemars(length(max = 4096))]
     pub cursor: Option<String>,
     #[schemars(range(min = 1, max = 4194304))]
@@ -561,11 +572,39 @@ pub struct ResumePackage {
     pub current_workspace_observation: Observed<WorkspaceObservation>,
     pub current_delta: Vec<ContextDelta>,
     pub resume_requirements: Vec<ResumeRequirement>,
-    pub related_context: Vec<FixedKnowledge>,
+    pub view: ResumeView,
+    pub related_context: Vec<RelatedKnowledge>,
     pub fixed_content_page: FixedContentPage,
+    pub omitted_sections: Vec<ResumeSection>,
     pub omitted_categories: Vec<Text>,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeSection {
+    RelatedContext,
+    FixedReferenceBodies,
+    HistoricalAttempts,
+    HistoricalVerifications,
+    ReferencePurposes,
+    FixedReferences,
+    WorkspaceFileObservations,
+    SnapshotMetadata,
+    SnapshotNotes,
+    DerivedRequirements,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RelatedKnowledge {
+    pub id: Identifier,
+    pub revision: Revision,
+    pub key: Identifier,
+    pub match_reason: Text,
+    pub applicability: Applicability,
+    pub excerpt: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -595,13 +634,37 @@ pub enum ErrorCode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct DomainError {
     pub code: ErrorCode,
     pub message: Text,
     pub recovery_hint: Text,
     pub required_bytes: Option<u64>,
     pub full_result_pointer: Option<Identifier>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub budget_details: Option<Box<BudgetDetails>>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub ownership_details: Option<Box<OwnershipDetails>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct BudgetDetails {
+    pub min_required_bytes: u64,
+    pub largest_fields: Vec<BudgetField>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct BudgetField {
+    pub field: String,
+    pub bytes: u64,
+    pub percent: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OwnershipDetails {
+    pub task_id: Identifier,
+    pub current_revision: Revision,
+    pub current_epoch: Revision,
+    pub owner_workflow_id: Option<Identifier>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -623,6 +686,7 @@ pub fn catalog() -> ContractCatalog {
         ("context_resume".into(), schema::<ContextResumeInput>()),
         ("task_create".into(), schema::<TaskCreateInput>()),
         ("task_claim".into(), schema::<TaskClaimInput>()),
+        ("task_release".into(), schema::<TaskClaimInput>()),
         ("checkpoint_save".into(), schema::<CheckpointSaveInput>()),
         ("knowledge_write".into(), schema::<KnowledgeWriteInput>()),
         ("memory_search".into(), schema::<MemorySearchInput>()),
@@ -631,7 +695,7 @@ pub fn catalog() -> ContractCatalog {
         ("task_list".into(), schema::<TaskListInput>()),
     ]);
     ContractCatalog {
-        contract_version: "0.3.0".into(),
+        contract_version: "0.4.0".into(),
         executable_tools: [
             "contract_get",
             "system_doctor",
@@ -639,6 +703,7 @@ pub fn catalog() -> ContractCatalog {
             "context_resume",
             "task_create",
             "task_claim",
+            "task_release",
             "checkpoint_save",
             "knowledge_write",
             "memory_get",

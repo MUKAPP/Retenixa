@@ -1,6 +1,10 @@
 use super::*;
 impl Service {
     pub(super) fn resume(&self, input: ContextResumeInput) -> Result<Value> {
+        util::validate_budget(input.byte_budget)?;
+        if input.view == ResumeView::Compact && input.cursor.is_some() {
+            return Err(DomainError::invalid("compact 视图不支持固定正文分页"));
+        }
         let cursor = input
             .cursor
             .as_ref()
@@ -53,24 +57,6 @@ impl Service {
             &a.project,
             &checkpoint,
         )?;
-        let page_signature = util::hash(util::canonical(
-            &json!({"project":a.project,"task":input.task_id,"checkpoint":checkpoint,"refs":knowledge_refs,"evidence":evidence_refs}),
-        )?);
-        let offset = if let Some(c) = &cursor {
-            if c["filter"].as_str() != Some(&page_signature)
-                || c["checkpoint"].as_str() != Some(checkpoint.as_str())
-            {
-                return Err(DomainError::invalid(
-                    "恢复 cursor 与项目、任务或选定检查点不一致",
-                ));
-            }
-            c["offset"]
-                .as_u64()
-                .filter(|n| *n <= 2000)
-                .ok_or_else(|| DomainError::invalid("恢复 cursor 位置无效"))? as usize
-        } else {
-            0
-        };
         let mut fixed_knowledge = Vec::new();
         let mut fixed_evidence = Vec::new();
         let mut delta = Vec::new();
@@ -180,6 +166,26 @@ impl Service {
                 }
             }
         }
+        let page_signature = util::hash(util::canonical(&json!({
+            "project":a.project,"task":input.task_id,"checkpoint":checkpoint,"view":input.view,
+            "knowledge":fixed_knowledge.iter().map(|r| (&r.knowledge_id,&r.revision)).collect::<Vec<_>>(),
+            "evidence":fixed_evidence.iter().map(|r| (&r.evidence_id,&r.source_revision)).collect::<Vec<_>>()
+        }))?);
+        let offset = if let Some(c) = &cursor {
+            if c["filter"].as_str() != Some(&page_signature)
+                || c["checkpoint"].as_str() != Some(checkpoint.as_str())
+            {
+                return Err(DomainError::invalid(
+                    "恢复 cursor 不匹配或固定正文可用性已变化，请刷新恢复",
+                ));
+            }
+            c["offset"]
+                .as_u64()
+                .filter(|n| *n <= 2000)
+                .ok_or_else(|| DomainError::invalid("恢复 cursor 位置无效"))? as usize
+        } else {
+            0
+        };
         if t["owner_workflow_id"] != json!(owner) || t["ownership_epoch"].as_i64() != Some(epoch) {
             delta.push(change(
                 DeltaKind::OwnershipChanged,
@@ -305,12 +311,21 @@ impl Service {
         {
             requirements.push(ResumeRequirement {
                 subject_id: input.task_id.clone(),
-                action: Text("当前 workflow 没有该任务写权；认领无主任务或经明确管理转交".into()),
+                action: Text("当前 workflow 没有该任务写权；按归属使用 task_claim，或由原所有者释放、操作者转交".into()),
                 available_evidence: Vec::new(),
             });
         }
-        let (related, related_more) = self.related_knowledge(&input.context_id.0, &a, &snapshot)?;
-        let mut package = ResumePackage {
+        let limit = match input.view {
+            ResumeView::Compact => 0,
+            ResumeView::Standard => 2,
+            ResumeView::Full => 5,
+        };
+        let (related, related_more) = if limit == 0 || offset != 0 {
+            (Vec::new(), offset == 0)
+        } else {
+            self.related_knowledge(&input.context_id.0, &a, &snapshot, &knowledge_refs, limit)?
+        };
+        let package = ResumePackage {
             schema_version: 1,
             returned_at: Timestamp(util::now()),
             saved_context: SavedContext {
@@ -328,151 +343,20 @@ impl Service {
             current_workspace_observation: current_observation,
             current_delta: delta,
             resume_requirements: requirements,
-            related_context: Vec::new(),
+            view: input.view,
+            related_context: related,
             fixed_content_page: FixedContentPage {
                 offset: offset as u32,
                 returned: 0,
                 total: 0,
             },
+            omitted_sections: Vec::new(),
             omitted_categories: Vec::new(),
             has_more: false,
             next_cursor: None,
         };
-        let knowledge = std::mem::take(&mut package.saved_context.fixed_knowledge);
-        let evidence = std::mem::take(&mut package.saved_context.fixed_evidence);
-        let total = knowledge.len() + evidence.len();
-        if offset > total {
-            return Err(DomainError::invalid(
-                "恢复 cursor 越界，正文可用性已变化，请刷新恢复",
-            ));
-        }
-        package.fixed_content_page.total = total as u32;
-        set_page_state(&mut package, offset, total, &page_signature, &checkpoint)?;
-        let mut complete = package.clone();
-        complete.saved_context.fixed_knowledge = knowledge.iter().skip(offset).cloned().collect();
-        complete.saved_context.fixed_evidence = evidence
-            .iter()
-            .skip(offset.saturating_sub(knowledge.len()))
-            .cloned()
-            .collect();
-        set_page_state(&mut complete, total, total, &page_signature, &checkpoint)?;
-        if related.is_empty() && !related_more {
-            complete
-                .omitted_categories
-                .retain(|x| !x.0.starts_with("related_context"));
-        }
-        let mut end = offset;
-        if util::budget(&complete, input.byte_budget, Some(checkpoint.clone())).is_ok() {
-            package = complete;
-            end = total;
-        } else {
-            util::budget(&package, input.byte_budget, Some(checkpoint.clone()))?;
-            for at in offset..total {
-                if at < knowledge.len() {
-                    package
-                        .saved_context
-                        .fixed_knowledge
-                        .push(knowledge[at].clone());
-                } else {
-                    package
-                        .saved_context
-                        .fixed_evidence
-                        .push(evidence[at - knowledge.len()].clone());
-                }
-                set_page_state(&mut package, at + 1, total, &page_signature, &checkpoint)?;
-                if let Err(error) =
-                    util::budget(&package, input.byte_budget, Some(checkpoint.clone()))
-                {
-                    if at < knowledge.len() {
-                        package.saved_context.fixed_knowledge.pop();
-                    } else {
-                        package.saved_context.fixed_evidence.pop();
-                    }
-                    set_page_state(&mut package, at, total, &page_signature, &checkpoint)?;
-                    if at == offset {
-                        return Err(error);
-                    }
-                    break;
-                }
-                end = at + 1;
-            }
-        }
-        if end == total {
-            let related_total = related.len();
-            for item in related {
-                package.related_context.push(item);
-                if util::budget(&package, input.byte_budget, Some(checkpoint.clone())).is_err() {
-                    package.related_context.pop();
-                    break;
-                }
-            }
-            if package.related_context.len() == related_total && !related_more {
-                package
-                    .omitted_categories
-                    .retain(|x| !x.0.starts_with("related_context"));
-            }
-        }
+        let package = fit_resume(package, related_more, &page_signature, input.byte_budget)?;
         util::json(&util::budget(package, input.byte_budget, Some(checkpoint))?)
-    }
-    fn related_knowledge(
-        &self,
-        context: &str,
-        a: &Access,
-        snapshot: &CheckpointSnapshot,
-    ) -> Result<(Vec<FixedKnowledge>, bool)> {
-        let response = self.memory_search(MemorySearchInput {
-            context_id: Identifier(context.into()),
-            query: snapshot.goal.0.chars().take(256).collect(),
-            kind: SearchKind::Knowledge,
-            scope: SearchScope {
-                task_id: None,
-                workspace_id: Some(Identifier(a.workspace.clone())),
-                path_prefix: snapshot
-                    .workspace
-                    .related_files
-                    .first()
-                    .map(|f| f.path.clone()),
-                include_inactive: false,
-                conditions: Vec::new(),
-            },
-            cursor: None,
-            byte_budget: 65536,
-            limit: 5,
-        });
-        let response = match response {
-            Ok(r) => r,
-            Err(e) if matches!(e.code, ErrorCode::BudgetTooSmall | ErrorCode::InvalidInput) => {
-                return Ok((Vec::new(), true));
-            }
-            Err(e) => return Err(e),
-        };
-        let mut conn = self.store.connect()?;
-        let tx = conn.transaction()?;
-        self.access(&tx, context, false)?;
-        let mut related = Vec::new();
-        for candidate in response["results"].as_array().into_iter().flatten() {
-            if candidate["applicability"] != "match" {
-                continue;
-            }
-            let id = candidate["entity_id"].as_str().unwrap_or("");
-            let revision = candidate["revision"].as_i64().unwrap_or(0);
-            let record=tx.query_row("SELECT v.claim,v.content_hash FROM knowledge k JOIN knowledge_revisions v ON k.project_id=v.project_id AND k.id=v.id AND k.current_revision=v.revision WHERE k.project_id=?1 AND k.id=?2 AND k.current_revision=?3 AND k.status='active'",params![a.project,id,revision],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,String>(1)?))).optional()?;
-            if let Some((Some(claim), hash)) = record {
-                related.push(FixedKnowledge {
-                    knowledge_id: Identifier(id.into()),
-                    revision: Revision(revision),
-                    claim: Text(claim),
-                    content_sha256: Sha256(hash),
-                    status: KnowledgeStatus::Active,
-                });
-            }
-        }
-        tx.commit()?;
-        Ok((
-            related,
-            response["has_more"].as_bool().unwrap_or(false)
-                || response["scan_limit_reached"].as_bool().unwrap_or(false),
-        ))
     }
     pub(super) fn memory_get(&self, input: MemoryGetInput) -> Result<Value> {
         if input.ids.is_empty() || input.ids.len() > 100 {
@@ -540,32 +424,185 @@ impl Service {
         Ok(out)
     }
 }
-fn set_page_state(
-    package: &mut ResumePackage,
-    end: usize,
-    total: usize,
+fn fit_resume(
+    mut p: ResumePackage,
+    related_more: bool,
     signature: &str,
-    checkpoint: &str,
+    budget: u32,
+) -> Result<ResumePackage> {
+    let fits = |p: &ResumePackage| Ok::<_, DomainError>(util::payload_bytes(p)? <= budget as usize);
+    let mut knowledge = std::mem::take(&mut p.saved_context.fixed_knowledge);
+    let mut evidence = std::mem::take(&mut p.saved_context.fixed_evidence);
+    let total = knowledge.len() + evidence.len();
+    let offset = p.fixed_content_page.offset as usize;
+    if offset > total {
+        return Err(DomainError::invalid(
+            "恢复 cursor 越界，正文可用性已变化，请刷新恢复",
+        ));
+    }
+    p.fixed_content_page.total = total as u32;
+    drop(evidence.drain(..offset.saturating_sub(knowledge.len())));
+    drop(knowledge.drain(..offset.min(knowledge.len())));
+    if related_more {
+        omit(&mut p, ResumeSection::RelatedContext);
+    }
+    if p.view != ResumeView::Compact {
+        p.fixed_content_page.returned = (total - offset) as u32;
+        p.saved_context.fixed_knowledge = knowledge;
+        p.saved_context.fixed_evidence = evidence;
+        if fits(&p)? {
+            return Ok(p);
+        }
+        if !p.related_context.is_empty() {
+            p.related_context.clear();
+            if !related_more {
+                omit(&mut p, ResumeSection::RelatedContext);
+            }
+            if fits(&p)? {
+                return Ok(p);
+            }
+        }
+        knowledge = std::mem::take(&mut p.saved_context.fixed_knowledge);
+        evidence = std::mem::take(&mut p.saved_context.fixed_evidence);
+    }
+    p.fixed_content_page.returned = 0;
+    if offset < total {
+        omit(&mut p, ResumeSection::FixedReferenceBodies);
+    }
+    if p.view != ResumeView::Compact && offset + 1 < total {
+        // The full page has already been tried. Partial pages share the same omission and cursor overhead.
+        let mut low = 0;
+        let mut high = total - offset;
+        while low + 1 < high {
+            let count = (low + high) / 2;
+            fill_fixed_page(&mut p, &knowledge, &evidence, count, signature)?;
+            if fits(&p)? {
+                low = count;
+            } else {
+                high = count;
+            }
+        }
+        if low > 0 {
+            fill_fixed_page(&mut p, &knowledge, &evidence, low, signature)?;
+            return Ok(p);
+        }
+        p.saved_context.fixed_knowledge.clear();
+        p.saved_context.fixed_evidence.clear();
+        p.fixed_content_page.returned = 0;
+        p.has_more = false;
+        p.next_cursor = None;
+    }
+    if p.view != ResumeView::Compact && fits(&p)? {
+        return Ok(p);
+    }
+    if !p.saved_context.snapshot.attempts.is_empty() {
+        p.saved_context.snapshot.attempts.clear();
+        omit(&mut p, ResumeSection::HistoricalAttempts);
+    }
+    if p.view != ResumeView::Compact && fits(&p)? {
+        return Ok(p);
+    }
+    if !p.saved_context.snapshot.verifications.is_empty() {
+        p.saved_context.snapshot.verifications.clear();
+        omit(&mut p, ResumeSection::HistoricalVerifications);
+    }
+    if fits(&p)? {
+        return Ok(p);
+    }
+    // Tiny metadata fields can cost less than their omission markers. Keep only reductions
+    // that actually save bytes, so the budget error gives a usable minimum on retry.
+    type Trim = fn(&mut ResumePackage);
+    let trims: [(ResumeSection, Trim); 6] = [
+        (ResumeSection::ReferencePurposes, |p| {
+            let saved = &mut p.saved_context;
+            for purpose in saved
+                .knowledge_refs
+                .iter_mut()
+                .map(|r| &mut r.purpose)
+                .chain(saved.evidence_refs.iter_mut().map(|r| &mut r.purpose))
+            {
+                if purpose.0.len() > 3 {
+                    purpose.0 = "…".into();
+                }
+            }
+        }),
+        (ResumeSection::WorkspaceFileObservations, |p| {
+            p.saved_context.snapshot.workspace.related_files.clear();
+            p.saved_context
+                .service_workspace_observation
+                .related_files
+                .clear();
+            if let Observed::Known { value } = &mut p.current_workspace_observation {
+                value.related_files.clear();
+            }
+        }),
+        (ResumeSection::SnapshotNotes, |p| {
+            p.saved_context.snapshot.no_references_reason = None;
+        }),
+        (ResumeSection::DerivedRequirements, |p| {
+            p.resume_requirements.drain(..p.current_delta.len());
+        }),
+        (ResumeSection::FixedReferences, |p| {
+            p.saved_context.knowledge_refs.clear();
+            p.saved_context.evidence_refs.clear();
+        }),
+        (ResumeSection::SnapshotMetadata, |p| {
+            let snapshot = &mut p.saved_context.snapshot;
+            snapshot.completion_conditions.clear();
+            if snapshot.scope.0.len() > 3 {
+                snapshot.scope = Text("…".into());
+            }
+        }),
+    ];
+    let mut bytes = util::payload_bytes(&p)?;
+    for (section, trim) in trims {
+        let mut candidate = p.clone();
+        trim(&mut candidate);
+        omit(&mut candidate, section);
+        let candidate_bytes = util::payload_bytes(&candidate)?;
+        if candidate_bytes < bytes {
+            p = candidate;
+            bytes = candidate_bytes;
+            if bytes <= budget as usize {
+                break;
+            }
+        }
+    }
+    Ok(p)
+}
+
+fn fill_fixed_page(
+    p: &mut ResumePackage,
+    knowledge: &[FixedKnowledge],
+    evidence: &[FixedEvidence],
+    count: usize,
+    signature: &str,
 ) -> Result<()> {
-    package.fixed_content_page.returned = end as u32 - package.fixed_content_page.offset;
-    package.has_more = end < total;
-    package.next_cursor = if end < total {
-        Some(util::cursor(
-            &json!({"filter":signature,"checkpoint":checkpoint,"offset":end}),
-        )?)
-    } else {
-        None
-    };
-    package.omitted_categories = if end < total {
-        vec![Text(format!(
-            "fixed_reference_bodies：共 {total} 项，本页从 {} 返回 {} 项，其余经 context_resume.next_cursor 读取；完整快照、变化摘要和未知操作均保留",
-            package.fixed_content_page.offset, package.fixed_content_page.returned
-        ))]
-    } else {
-        Vec::new()
-    };
-    package.omitted_categories.push(Text("related_context：补充知识按预算或结果上限省略，可显式 memory_search/memory_get；未自动采用为固定依据".into()));
+    p.saved_context.fixed_knowledge = knowledge[..count.min(knowledge.len())].to_vec();
+    p.saved_context.fixed_evidence = evidence[..count.saturating_sub(knowledge.len())].to_vec();
+    p.fixed_content_page.returned = count as u32;
+    p.has_more = true;
+    p.next_cursor = Some(util::cursor(&json!({
+        "filter":signature,"checkpoint":p.saved_context.checkpoint_id,"offset":p.fixed_content_page.offset + count as u32
+    }))?);
     Ok(())
+}
+
+fn omit(p: &mut ResumePackage, section: ResumeSection) {
+    p.omitted_sections.push(section);
+    let label = match section {
+        ResumeSection::RelatedContext => "related_context",
+        ResumeSection::FixedReferenceBodies => "fixed_reference_bodies",
+        ResumeSection::HistoricalAttempts => "historical_attempts",
+        ResumeSection::HistoricalVerifications => "historical_verifications",
+        ResumeSection::ReferencePurposes => "reference_purposes",
+        ResumeSection::FixedReferences => "fixed_references",
+        ResumeSection::WorkspaceFileObservations => "workspace_file_observations",
+        ResumeSection::SnapshotMetadata => "snapshot_metadata",
+        ResumeSection::SnapshotNotes => "snapshot_notes",
+        ResumeSection::DerivedRequirements => "derived_requirements",
+    };
+    p.omitted_categories.push(Text(label.into()));
 }
 fn change(
     kind: DeltaKind,

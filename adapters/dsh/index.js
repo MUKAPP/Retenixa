@@ -8,7 +8,7 @@ const runFile = promisify(execFile);
 const adapterVersion = createRequire(import.meta.url)('./package.json').version;
 const copy = value => JSON.parse(JSON.stringify(value));
 const hash = value => createHash('sha256').update(value).digest('hex');
-const writes = new Set(['task_create','task_claim','checkpoint_save','knowledge_write']);
+const writes = new Set(['task_create','task_claim','task_release','checkpoint_save','knowledge_write']);
 const definitiveRejections = new Set(['INVALID_INPUT','NOT_FOUND','VERSION_CONFLICT','OWNERSHIP_CHANGED','CLAIM_DENIED','REQUEST_ID_REUSED','REFERENCE_UNAVAILABLE','PROJECT_SCOPE_MISMATCH']);
 const noContext = new Set(['contract_get','system_doctor']);
 const prefix = 'mcp__retenixa__';

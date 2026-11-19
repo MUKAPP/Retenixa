@@ -1,4 +1,4 @@
-use crate::contracts::{DomainError, ErrorCode, Text};
+use crate::contracts::{DomainError, ErrorCode, Identifier, OwnershipDetails, Revision, Text};
 use std::fmt;
 pub type Result<T> = std::result::Result<T, DomainError>;
 impl DomainError {
@@ -19,10 +19,28 @@ impl DomainError {
             recovery_hint: Text(hint.into()),
             required_bytes: None,
             full_result_pointer: None,
+            budget_details: None,
+            ownership_details: None,
         }
     }
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidInput, message)
+    }
+    pub fn ownership_changed(
+        message: &str,
+        task_id: &str,
+        revision: i64,
+        epoch: i64,
+        owner: Option<&str>,
+    ) -> Self {
+        let mut error = Self::new(ErrorCode::OwnershipChanged, message);
+        error.ownership_details = Some(Box::new(OwnershipDetails {
+            task_id: Identifier(task_id.into()),
+            current_revision: Revision(revision),
+            current_epoch: Revision(epoch),
+            owner_workflow_id: owner.map(|id| Identifier(id.into())),
+        }));
+        error
     }
     pub fn storage(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::StorageBusy, message)
@@ -30,7 +48,21 @@ impl DomainError {
 }
 impl fmt::Display for DomainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message.0)
+        write!(f, "{:?}: {}", self.code, self.message.0)?;
+        if let Some(details) = &self.ownership_details {
+            write!(
+                f,
+                " (task_id={}, current_revision={}, current_epoch={}, owner_workflow_id={})",
+                details.task_id.0,
+                details.current_revision.0,
+                details.current_epoch.0,
+                details
+                    .owner_workflow_id
+                    .as_ref()
+                    .map_or("null", |id| id.0.as_str())
+            )?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for DomainError {}

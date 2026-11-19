@@ -294,7 +294,7 @@ impl Service {
                 }
                 let wf = util::id();
                 tx.execute(
-                    "INSERT INTO workflows VALUES(?1,?2,?3,?4,1,?5)",
+                    "INSERT INTO workflows(project_id,id,binding_hash,host_identity,generation,active_context_id) VALUES(?1,?2,?3,?4,1,?5)",
                     params![
                         project,
                         wf,
@@ -308,8 +308,8 @@ impl Service {
         } else {
             let wf = util::id();
             tx.execute(
-                "INSERT INTO workflows VALUES(?1,?2,NULL,NULL,1,?3)",
-                params![project, wf, context],
+                "INSERT INTO workflows(project_id,id,generation,active_context_id,stdio_process_json) VALUES(?1,?2,1,?3,?4)",
+                params![project, wf, context, self.stdio_process.as_ref().map(serde_json::to_string).transpose()?],
             )?;
             (wf, 1)
         };

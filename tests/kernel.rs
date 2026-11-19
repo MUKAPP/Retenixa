@@ -561,13 +561,19 @@ fn largest_escaped_snapshot_has_retrievable_full_pointer() {
     assert!(serde_json::to_vec(&input["snapshot"]).unwrap().len() < 524288);
     let saved = call(&s, "checkpoint_save", input);
     let id = saved["result"]["checkpoint_id"].clone();
-    let e=s.call("memory_get",json!({"context_id":c["context_id"],"ids":[id],"revision":null,"cursor":null,"byte_budget":1048576})).unwrap_err();
+    let e=s.call("memory_get",json!({"context_id":c["context_id"],"ids":[id],"revision":null,"cursor":null,"byte_budget":480000})).unwrap_err();
     assert!(matches!(e.code, ErrorCode::BudgetTooSmall));
-    assert!(e.required_bytes.unwrap() > 1048576);
+    assert_eq!(e.full_result_pointer.unwrap().0, id.as_str().unwrap());
+    let required = e.required_bytes.unwrap() as usize;
     let full = call(
         &s,
         "memory_get",
-        json!({"context_id":c["context_id"],"ids":[id],"revision":null,"cursor":null,"byte_budget":4194304}),
+        json!({"context_id":c["context_id"],"ids":[id],"revision":null,"cursor":null,"byte_budget":1048576}),
+    );
+    assert_eq!(util::payload_bytes(&full).unwrap(), required);
+    assert!(
+        util::payload_bytes(&rmcp::model::CallToolResult::structured(full.clone())).unwrap()
+            > 1048576
     );
     assert_eq!(
         full["records"][0]["snapshot"]["progress"]

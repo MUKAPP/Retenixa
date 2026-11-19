@@ -218,7 +218,7 @@ fn plan(conn: &Connection, input: &ProjectMergeInput) -> Result<Value> {
     for table in TABLES
         .iter()
         .copied()
-        .chain((version == 3).then_some("workflow_host_aliases"))
+        .chain((version >= 3).then_some("workflow_host_aliases"))
     {
         let n: i64 = conn.query_row(
             &format!("SELECT count(*) FROM {table} WHERE project_id=?1"),
@@ -309,7 +309,7 @@ pub fn project_merge(root: &Path, input: ProjectMergeInput, confirmed: bool) -> 
         ));
     }
     tx.pragma_update(None, "defer_foreign_keys", true)?;
-    storage::migrate_identity(&tx)?;
+    storage::migrate_after_search(&tx)?;
     let source = &input.source_project_id.0;
     let target = &input.target_project_id.0;
     let workspace = util::text(&before, "workspace_id");

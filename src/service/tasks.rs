@@ -13,15 +13,42 @@ impl Service {
         let payload = util::json(&input)?;
         self.mutate(&input.context_id.0,&input.request_id.0,"task_claim",payload,|tx,a|{
         let t=task(tx,&a.project,&input.task_id.0)?;
+        if t["ownership_epoch"].as_i64()!=Some(input.expected_epoch.0){return Err(task_ownership_error(&t,"任务 ownership_epoch 已变化"));}
         if t["revision"].as_i64()!=Some(input.expected_revision.0){return Err(DomainError::new(ErrorCode::VersionConflict,"任务 revision 已变化"));}
-        if t["ownership_epoch"].as_i64()!=Some(input.expected_epoch.0){return Err(DomainError::new(ErrorCode::OwnershipChanged,"任务 ownership_epoch 已变化"));}
         if matches!(t["status"].as_str(),Some("completed"|"abandoned")){return Err(DomainError::invalid("终态任务不能认领"));}
-        if t["owner_workflow_id"].as_str()==Some(a.workflow.as_str()){return Ok((json!({"task":t}),vec![version(&input.task_id.0,input.expected_revision.0)]));}
-        if !t["owner_workflow_id"].is_null(){return Err(DomainError::new(ErrorCode::ClaimDenied,"任务属于另一个 workflow；需要管理转交"));}
+        let owner=t["owner_workflow_id"].as_str();
+        if owner==Some(a.workflow.as_str()){return Ok((json!({"task":t}),vec![version(&input.task_id.0,input.expected_revision.0)]));}
+        if let Some(owner)=owner {
+            let process: Option<String> = tx.query_row(
+                "SELECT stdio_process_json FROM workflows WHERE project_id=?1 AND id=?2 AND binding_hash IS NULL",
+                params![a.project, owner], |r| r.get(0),
+            ).optional()?.flatten();
+            let owner_process = process.as_deref().and_then(|raw| serde_json::from_str(raw).ok());
+            if !self.stdio_process.as_ref().zip(owner_process.as_ref()).is_some_and(|(local, owner)| local.confirms_exit(owner)) {
+                return Err(DomainError::new(ErrorCode::ClaimDenied,"原工作流不是已确认退出的本机普通 stdio；请由原所有者释放或通过管理转交"));
+            }
+        }
         let rev=next(input.expected_revision.0)?;let epoch=next(input.expected_epoch.0)?;
-        let n=tx.execute("UPDATE tasks SET owner_workflow_id=?1,revision=?2,ownership_epoch=?3 WHERE project_id=?4 AND id=?5 AND revision=?6 AND ownership_epoch=?7 AND owner_workflow_id IS NULL",params![a.workflow,rev,epoch,a.project,input.task_id.0,input.expected_revision.0,input.expected_epoch.0])?;
+        let n=tx.execute("UPDATE tasks SET owner_workflow_id=?1,revision=?2,ownership_epoch=?3 WHERE project_id=?4 AND id=?5 AND revision=?6 AND ownership_epoch=?7 AND owner_workflow_id IS ?8",params![a.workflow,rev,epoch,a.project,input.task_id.0,input.expected_revision.0,input.expected_epoch.0,owner])?;
         if n!=1{return Err(DomainError::new(ErrorCode::VersionConflict,"原子认领未命中"));}
         Ok((json!({"task":task(tx,&a.project,&input.task_id.0)?}),vec![version(&input.task_id.0,rev)]))})
+    }
+    pub(super) fn release_task(&self, input: TaskClaimInput) -> Result<Value> {
+        let payload = util::json(&input)?;
+        self.mutate(&input.context_id.0, &input.request_id.0, "task_release", payload, |tx, a| {
+            let t = task(tx, &a.project, &input.task_id.0)?;
+            check_task(&t, a, input.expected_revision.0, input.expected_epoch.0)?;
+            let rev = next(input.expected_revision.0)?;
+            let epoch = next(input.expected_epoch.0)?;
+            let changed = tx.execute(
+                "UPDATE tasks SET owner_workflow_id=NULL,revision=?1,ownership_epoch=?2 WHERE project_id=?3 AND id=?4 AND revision=?5 AND ownership_epoch=?6 AND owner_workflow_id=?7",
+                params![rev, epoch, a.project, input.task_id.0, input.expected_revision.0, input.expected_epoch.0, a.workflow],
+            )?;
+            if changed != 1 {
+                return Err(DomainError::new(ErrorCode::VersionConflict, "原子释放未命中"));
+            }
+            Ok((json!({"task":task(tx,&a.project,&input.task_id.0)?}), vec![version(&input.task_id.0, rev)]))
+        })
     }
     pub(super) fn save_checkpoint(&self, input: CheckpointSaveInput) -> Result<Value> {
         let payload = util::json(&input)?;

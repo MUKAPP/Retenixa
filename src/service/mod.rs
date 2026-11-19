@@ -13,6 +13,7 @@ pub struct Service {
     pub store: Store,
     connection_id: String,
     host: Option<Arc<HostAttachment>>,
+    stdio_process: Option<crate::process_identity::ProcessIdentity>,
 }
 #[derive(Clone)]
 struct Access {
@@ -27,7 +28,15 @@ impl Service {
             store,
             connection_id: util::id(),
             host: host.map(Arc::new),
+            stdio_process: None,
         }
+    }
+    pub(crate) fn for_stdio(store: Store, host: Option<HostAttachment>) -> Self {
+        let mut service = Self::new(store, host);
+        if service.host.is_none() {
+            service.stdio_process = crate::process_identity::ProcessIdentity::current();
+        }
+        service
     }
     pub fn call(&self, op: &str, input: Value) -> Result<Value> {
         util::validate_tree(&input, 0)?;
@@ -38,6 +47,7 @@ impl Service {
             "context_open" => self.open_context(util::parse(input)?),
             "task_create" => self.create_task(util::parse(input)?),
             "task_claim" => self.claim_task(util::parse(input)?),
+            "task_release" => self.release_task(util::parse(input)?),
             "checkpoint_save" => self.save_checkpoint(util::parse(input)?),
             "knowledge_write" => self.write_knowledge(util::parse(input)?),
             "context_resume" => self.resume(util::parse(input)?),
@@ -182,22 +192,29 @@ fn task(conn: &Connection, project: &str, id: &str) -> Result<Value> {
     conn.query_row("SELECT revision,ownership_epoch,owner_workflow_id,status,goal,scope,parent_task_id,latest_checkpoint_id FROM tasks WHERE project_id=?1 AND id=?2",params![project,id],|r|Ok(json!({"task_id":id,"revision":r.get::<_,i64>(0)?,"ownership_epoch":r.get::<_,i64>(1)?,"owner_workflow_id":r.get::<_,Option<String>>(2)?,"status":r.get::<_,String>(3)?,"goal":r.get::<_,String>(4)?,"scope":r.get::<_,String>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"latest_checkpoint_id":r.get::<_,Option<String>>(7)?}))).optional()?.ok_or_else(||DomainError::new(ErrorCode::NotFound,"当前项目不存在该任务"))
 }
 fn check_task(t: &Value, a: &Access, rev: i64, epoch: i64) -> Result<()> {
+    if t["ownership_epoch"].as_i64() != Some(epoch)
+        || t["owner_workflow_id"].as_str() != Some(a.workflow.as_str())
+    {
+        return Err(task_ownership_error(t, "任务归属/所有权代次不匹配"));
+    }
     if t["revision"].as_i64() != Some(rev) {
         return Err(DomainError::new(
             ErrorCode::VersionConflict,
             "任务 revision 已变化",
         ));
     }
-    if t["ownership_epoch"].as_i64() != Some(epoch)
-        || t["owner_workflow_id"].as_str() != Some(a.workflow.as_str())
-    {
-        return Err(DomainError::new(
-            ErrorCode::OwnershipChanged,
-            "任务归属/所有权代次不匹配",
-        ));
-    }
     if matches!(t["status"].as_str(), Some("completed" | "abandoned")) {
         return Err(DomainError::invalid("终态任务不能隐式重开"));
     }
     Ok(())
+}
+
+fn task_ownership_error(t: &Value, message: &str) -> DomainError {
+    DomainError::ownership_changed(
+        message,
+        t["task_id"].as_str().unwrap(),
+        t["revision"].as_i64().unwrap(),
+        t["ownership_epoch"].as_i64().unwrap(),
+        t["owner_workflow_id"].as_str(),
+    )
 }

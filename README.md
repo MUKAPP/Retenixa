@@ -87,7 +87,7 @@ MCP 接入提供工具，还需要告诉 Agent 何时读取、何时保存。把
 | 用途 | 工具 |
 | --- | --- |
 | 打开项目、恢复任务 | context_open、context_resume |
-| 列出、创建、认领任务 | task_list、task_create、task_claim |
+| 列出、创建、认领、释放任务 | task_list、task_create、task_claim、task_release |
 | 保存进度或结案 | checkpoint_save |
 | 检索与精确读取 | memory_search、memory_get |
 | 提交和修订知识 | knowledge_write |
@@ -95,17 +95,32 @@ MCP 接入提供工具，还需要告诉 Agent 何时读取、何时保存。把
 
 DSH 适配插件额外提供 pending_requests 和 retry_request，用于查看、确认或按原始载荷重投结果未知的请求。明确的版本冲突、归属冲突或引用错误会结案，不会继续占用待确认列表或阻止切换项目；原请求重试返回原错误。
 
+### 恢复视图与预算
+
+`context_resume` 的 `view` 可选 `compact`、`standard`（默认）或 `full`：
+
+- `compact`：优先读取任务骨架、当前变化和未结操作；略去相关候选、固定正文和历史尝试/验证。
+- `standard`：首屏最多补充两条相关知识摘要；固定正文按预算返回，放不下一页时可分页。
+- `full`：首屏最多补充五条相关知识摘要；与 `standard` 一样受预算约束，仍可能裁剪。按检查点 ID 调 `memory_get` 可取原始快照和固定引用。
+
+相关候选依据观测文件路径、固定知识的路径范围和阻塞项检索。每条摘要带 ID、revision、key、命中原因、适用性和最多 100 字摘录。候选不会自动纳入固定依据，正文按 ID 和 revision 调 `memory_get` 读取。
+
+恢复和检索的 `byte_budget` 只计一份 UTF-8 JSON 载荷（MCP `structuredContent`），不计兼容镜像。恢复预算不足时依次省略相关候选、固定正文和历史细节，必要时再省略其他非核心元数据。检查 `omitted_sections`；仅当必要载荷仍超预算才返回 `BUDGET_TOO_SMALL`，可按 `min_required_bytes` 调整，或查看 `largest_fields` 中的字节数及占比。有 `next_cursor` 时沿用同一 `view` 翻页；如果 `fixed_reference_bodies` 被标记省略但没有游标，按固定引用的 ID 和版本用 `memory_get` 补读。
+
 ### 跨会话与跨客户端交接
 
 普通 MCP 新会话通常对应独立工作流；DSH 适配器可在同一可信宿主会话恢复时保留工作流身份。独立会话、fork 或另一个客户端不会仅因打开同一项目而获得已有任务的写权。
 
-需要转交时，由操作者确认目标工作流和任务当前版本，然后使用管理命令（示例假定 retenixa.exe 已在 PATH 中，否则替换为实际可执行文件路径）：
+- **原所有者可操作**：先保存交接检查点，再用 `task_release` 释放非终态任务。接手者读取最新 revision、epoch 并调用 `task_claim`。
+- **原普通 stdio 已退出**：Windows 和 Linux 上，新普通 stdio 可用当前 `expected_revision` 和 `expected_epoch` 认领，前提是本机确认原进程身份已终止。原进程仍在、进程身份未知、升级前的普通工作流以及 DSH 持久工作流均不会按退出规则接管。
+- **需人工转交**：操作者可用短参数预览并在终端输入 `yes`；工具查出当前 revision、epoch，生成请求 ID，确认后按预览版本提交。脚本仍使用请求文件和显式确认。
 
 ~~~bash
+retenixa.exe transfer --data-dir D:/Data/Retenixa --project PROJECT_ID --task TASK_ID --to WORKFLOW_ID --reason "交接后续工作"
 retenixa.exe transfer --data-dir D:/Data/Retenixa --request-file D:/Data/transfer.json --confirm-transfer
 ~~~
 
-管理请求文件包含 project_id、task_id、target_workflow_id、expected_revision、expected_epoch、request_id 和 reason。ID 与版本取自实际工具结果；一次逻辑转交保留同一 request_id。转交成功后，旧所有者不能再更新该任务。
+管理请求文件包含 project_id、task_id、target_workflow_id、expected_revision、expected_epoch、request_id 和 reason。ID 与版本取自实际工具结果；一次逻辑转交保留同一 request_id。释放和转交都会提升 revision、epoch；旧所有者继续更新时，`OWNERSHIP_CHANGED` 提供 `task_id`、`current_revision`、`current_epoch` 和 `owner_workflow_id`。
 
 **恢复包是工作线索，不是执行授权。** 对仍在运行或结果未知的命令、发布、远程任务，应先到原宿主核查；Retenixa 的请求去重不覆盖外部操作。
 
@@ -162,7 +177,7 @@ retenixa.exe project-merge --data-dir D:/Data/Retenixa --request-file D:/Request
 
 预演返回迁移行数、待保留的宿主身份、唯一键冲突和 `plan_hash`。将该哈希写入请求文件的可选字段 `expected_plan_hash`，执行时可核对预演后数据库是否变化。真实执行会先创建 `pre-project-merge-*.sqlite3` 一致性备份，再在一个事务中升级 schema 并整合记录；任一步失败都会回滚数据库事务。任务、检查点、知识和证据的 ID、版本、正文与固定引用保持不变，旧请求保留原哈希命名空间。同一宿主的不同历史工作流分别保留，不自动转交任务；其他唯一键冲突会拒绝执行。
 
-整合后重新连接客户端，主目录与 worktree 可访问同一份项目记忆。数据库升级至 schema 3 后需使用核心 0.1.1 或更新版本；DSH 适配器 0.1.9 会继续使用初始化 Git 前该会话已有的绑定与待确认请求。
+整合后重新连接客户端，主目录与 worktree 可访问同一份项目记忆。升级到 schema 4 前，请停止指向同一数据目录的旧核心进程；升级后使用支持 schema 4 的核心。DSH 可继续使用初始化 Git 前该会话已有的绑定与待确认请求。
 
 DSH 插件另有需要随数据目录一起考虑的状态：绑定能力文件位于数据目录下的 host-bindings/dsh/，待确认请求的完整载荷记录在宿主持久存储中。宿主状态由 retenixa（绑定和请求身份索引）与 retenixa_requests（逐请求记录）两个域组成，备份宿主状态时应一起保存。SQLite 数据库备份不包含这两部分，只复制整个数据目录才会一并带上绑定文件。恢复较旧的数据库后，数据目录中的绑定文件仍记录着原代次，若高于数据库中的代次，附着会以 STALE_ATTACHMENT 停止：此时按原绑定恢复，或走显式转交，不手工改动代次。
 

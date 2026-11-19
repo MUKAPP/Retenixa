@@ -425,7 +425,7 @@ fn migration_preserves_authoritative_history_and_rebuilds_search() {
     );
 }
 #[test]
-fn complete_single_pin_recovery_fits_actual_final_wire_budget() {
+fn complete_single_pin_recovery_fits_exact_logical_budget() {
     let f = Fixture::new();
     let t = f.task();
     let k = f.accept(&f.propose("single-ref", "ZZZ-unrelated-proof", scope()));
@@ -433,9 +433,7 @@ fn complete_single_pin_recovery_fits_actual_final_wire_budget() {
     let mut input = json!({"context_id":f.context["context_id"],"task_id":t["task_id"],"checkpoint_id":null,"cursor":null,"byte_budget":1048576});
     let first = call(&f.service, "context_resume", input.clone());
     assert_eq!(first["has_more"], false);
-    let bytes = serde_json::to_vec(&rmcp::model::CallToolResult::structured(first.clone()))
-        .unwrap()
-        .len();
+    let bytes = util::payload_bytes(&first).unwrap();
     input["byte_budget"] = json!(bytes);
     let final_page = call(&f.service, "context_resume", input);
     assert_eq!(
@@ -462,7 +460,7 @@ fn budgeted_resume_keeps_core_and_pages_fixed_bodies_without_autopin() {
         refs.push(json!({"knowledge_id":k["knowledge_id"],"revision":2,"purpose":"明确使用的依据","content_sha256":null,"selection":"caller_explicit"}));
     }
     let saved = f.save(&t, f.snapshot(), json!(refs));
-    let mut input = json!({"context_id":f.context["context_id"],"task_id":t["task_id"],"checkpoint_id":null,"cursor":null,"byte_budget":46000});
+    let mut input = json!({"context_id":f.context["context_id"],"task_id":t["task_id"],"checkpoint_id":null,"cursor":null,"byte_budget":24000});
     let mut count = 0;
     let mut pages = 0;
     loop {
@@ -503,5 +501,101 @@ fn budgeted_resume_keeps_core_and_pages_fixed_bodies_without_autopin() {
         })
         .unwrap(),
         5
+    );
+}
+
+#[test]
+fn recovery_views_use_paths_pinned_scopes_and_blockers_without_including_claims() {
+    let f = Fixture::new();
+    let path_scope = |p| json!({"workspace_id":null,"path_prefix":p,"conditions":[]});
+    let pin = f.accept(&f.propose("pin-origin", "fixed detail", path_scope("docs/frozen")));
+    let observed = f.accept(&f.propose("file-policy", &"摘".repeat(130), path_scope("src/actual")));
+    let same_scope = f.accept(&f.propose(
+        "pinned-scope",
+        "shared location",
+        json!({"workspace_id":null,"path_prefix":"docs/frozen","conditions":["offline"]}),
+    ));
+    let blocked = f.accept(&f.propose("blocker-policy", "uniqueWorkflowBlocker", scope()));
+    let mut snapshot = f.snapshot();
+    snapshot["blockers"] = json!(["uniqueWorkflowBlocker"]);
+    snapshot["workspace"]["related_files"] = json!([{"path":"src/actual/f.rs","observed_at":util::now(),"sha256":{"state":"unknown","reason":"服务观测"}}]);
+    let task = f.task();
+    let refs = json!([{"knowledge_id":pin["knowledge_id"],"revision":2,"purpose":"pin","content_sha256":null,"selection":"caller_explicit"}]);
+    f.save(&task, snapshot, refs.clone());
+    let mut input =
+        json!({"context_id":f.context["context_id"],"task_id":task["task_id"],"byte_budget":64000});
+    let standard = call(&f.service, "context_resume", input.clone());
+    assert_eq!(standard["view"], "standard");
+    assert_eq!(standard["related_context"].as_array().unwrap().len(), 2);
+    assert_eq!(standard["omitted_sections"], json!(["related_context"]));
+    let first = &standard["related_context"][0];
+    assert_eq!(first["id"], observed["knowledge_id"]);
+    assert_eq!(first["key"], "file-policy");
+    assert_eq!(first["revision"], 2);
+    assert_eq!(first["applicability"], "match");
+    assert_eq!(first["excerpt"].as_str().unwrap().chars().count(), 100);
+    assert!(first.get("claim").is_none());
+    assert!(first["match_reason"].as_str().unwrap().contains("观测文件"));
+    assert_eq!(
+        standard["related_context"][1]["id"],
+        same_scope["knowledge_id"]
+    );
+    assert_eq!(
+        standard["related_context"][1]["applicability"],
+        "needs_review"
+    );
+    input["view"] = json!("full");
+    let full = call(&f.service, "context_resume", input.clone());
+    assert_eq!(full["related_context"][2]["id"], blocked["knowledge_id"]);
+    assert_eq!(
+        full["saved_context"]["fixed_knowledge"][0]["knowledge_id"],
+        pin["knowledge_id"]
+    );
+    input["view"] = json!("compact");
+    let compact = call(&f.service, "context_resume", input);
+    assert_eq!(compact["related_context"], json!([]));
+    assert_eq!(compact["saved_context"]["fixed_knowledge"], json!([]));
+    assert_eq!(compact["saved_context"]["knowledge_refs"], refs);
+}
+
+#[test]
+fn recovery_budget_error_reports_an_exact_retry_size_and_core_survives() {
+    let f = Fixture::new();
+    let task = f.task();
+    let mut snapshot = f.snapshot();
+    snapshot["progress"] =
+        json!([{"description":"CoreProgress".repeat(80),"state":"verified","artifacts":[]}]);
+    snapshot["attempts"] = json!([{"goal":"optional history","conditions":[],"method":"trial","state":"failed","result":"large history".repeat(500),"reason":{"state":"known","value":"synthetic"},"verification_refs":[]}]);
+    let saved = f.save(&task, snapshot.clone(), json!([]));
+    let mut input =
+        json!({"context_id":f.context["context_id"],"task_id":task["task_id"],"byte_budget":1});
+    let error = util::json(&f.service.call("context_resume", input.clone()).unwrap_err()).unwrap();
+    let min = error["min_required_bytes"].as_u64().unwrap();
+    assert_eq!(error["required_bytes"], min);
+    assert_eq!(error["full_result_pointer"], saved["checkpoint_id"]);
+    assert_eq!(
+        error["largest_fields"][0]["field"],
+        "saved_context.snapshot.progress"
+    );
+    input["byte_budget"] = json!(min - 1);
+    error_code_is_budget(&f, input.clone());
+    input["byte_budget"] = json!(min);
+    let page = call(&f.service, "context_resume", input);
+    assert_eq!(util::payload_bytes(&page).unwrap() as u64, min);
+    assert!(
+        page["omitted_sections"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("historical_attempts"))
+    );
+    for key in ["goal", "progress", "unresolved_operations", "next_steps"] {
+        assert_eq!(page["saved_context"]["snapshot"][key], snapshot[key]);
+    }
+}
+
+fn error_code_is_budget(f: &Fixture, input: Value) {
+    error(
+        f.service.call("context_resume", input),
+        ErrorCode::BudgetTooSmall,
     );
 }

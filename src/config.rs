@@ -22,9 +22,15 @@ pub enum Command {
         request_file: PathBuf,
         confirmed: bool,
     },
-    Transfer {
+    TransferFile {
         request_file: PathBuf,
         confirmed: bool,
+    },
+    TransferInteractive {
+        project: String,
+        task: String,
+        target: String,
+        reason: String,
     },
 }
 pub struct Config {
@@ -65,6 +71,10 @@ impl Config {
                     | "--output"
                     | "--input"
                     | "--request-file"
+                    | "--project"
+                    | "--task"
+                    | "--to"
+                    | "--reason"
             ) {
                 return Err(format!("未知参数：{flag}").into());
             }
@@ -113,10 +123,34 @@ impl Config {
                 request_file: path("--request-file", true)?.unwrap(),
                 confirmed: merge_confirmed,
             },
-            "transfer" => Command::Transfer {
-                request_file: path("--request-file", true)?.unwrap(),
-                confirmed,
-            },
+            "transfer" => {
+                if let Some(request_file) = path("--request-file", false)? {
+                    Command::TransferFile {
+                        request_file,
+                        confirmed,
+                    }
+                } else {
+                    if confirmed {
+                        return Err(
+                            "--confirm-transfer 仅搭配 --request-file；短参数模式需要在终端确认"
+                                .into(),
+                        );
+                    }
+                    let mut text = |flag: &str| -> AppResult<String> {
+                        values
+                            .remove(flag)
+                            .ok_or_else(|| format!("缺少 {flag}"))?
+                            .into_string()
+                            .map_err(|_| format!("{flag} 必须 UTF-8").into())
+                    };
+                    Command::TransferInteractive {
+                        project: text("--project")?,
+                        task: text("--task")?,
+                        target: text("--to")?,
+                        reason: text("--reason")?,
+                    }
+                }
+            }
             "host-init" => {
                 let host = values
                     .remove("--host")
@@ -139,7 +173,7 @@ impl Config {
         if !values.is_empty() {
             return Err("命令包含无关参数".into());
         }
-        if confirmed && !matches!(command, Command::Transfer { .. }) {
+        if confirmed && !matches!(command, Command::TransferFile { .. }) {
             return Err("确认标志仅用于 transfer".into());
         }
         if merge_confirmed && !matches!(command, Command::ProjectMerge { .. }) {

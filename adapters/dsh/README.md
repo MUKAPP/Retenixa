@@ -39,6 +39,8 @@ npm pack ./adapters/dsh --ignore-scripts --pack-destination ./target/packages
 
 将 [AGENTS.md 规则模板](../../docs/AGENT_RULES.md) 的通用规则和 DSH 补充规则加入目标项目的代理指令。插件提供工具和协议提示；任务阶段保存、验证归因与结案由 Agent 按规则执行。
 
+核心公布 `task_release` 时，适配器按普通写入流程代管其请求 ID。主动交接先保存阶段检查点，再释放任务。仅关闭 DSH 或其 stdio 子进程不会释放任务，原工作流仍可在可信宿主重启后恢复。
+
 ## 依赖与能力
 
 宿主需提供 agents、tools/native executor、workingDirectory、sessionProjections、systemPrompt、持久 session 及 storageDomain 后端。这些官方服务作为 peer 依赖由宿主提供，MCP 客户端和 zod 随包安装。

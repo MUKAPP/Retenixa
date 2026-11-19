@@ -172,6 +172,58 @@ pub struct TransferInput {
     pub request_id: crate::contracts::Identifier,
     pub reason: crate::contracts::Text,
 }
+pub fn preview_transfer(
+    root: &Path,
+    project: String,
+    task: String,
+    target: String,
+    reason: String,
+) -> Result<(TransferInput, Value)> {
+    let conn = Connection::open_with_flags(
+        root.join("retenixa.sqlite3"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    conn.busy_timeout(Duration::from_millis(750))?;
+    let app: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if app != APPLICATION_ID || !(2..=SCHEMA_VERSION).contains(&version) {
+        return Err(DomainError::new(
+            ErrorCode::SchemaUnsupported,
+            "数据库不兼容",
+        ));
+    }
+    let (rev, epoch, owner, status, goal, target_exists): (i64, i64, Option<String>, String, String, bool) = conn.query_row(
+        "SELECT revision,ownership_epoch,owner_workflow_id,status,goal,EXISTS(SELECT 1 FROM workflows WHERE project_id=?1 AND id=?3) FROM tasks WHERE project_id=?1 AND id=?2",
+        params![project, task, target], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    ).optional()?.ok_or_else(|| DomainError::new(ErrorCode::NotFound, "当前项目不存在该任务"))?;
+    if !target_exists {
+        return Err(DomainError::new(
+            ErrorCode::ProjectScopeMismatch,
+            "目标 workflow 不属于该项目",
+        ));
+    }
+    check_transferable(rev, epoch, &status)?;
+    if reason.trim().is_empty() {
+        return Err(DomainError::invalid("转交原因不能为空"));
+    }
+    let input = util::parse(json!({
+        "project_id":project,"task_id":task,"target_workflow_id":target,
+        "expected_revision":rev,"expected_epoch":epoch,"request_id":util::id(),"reason":reason
+    }))?;
+    let summary = json!({"goal":goal,"status":status,"owner_workflow_id":owner,"new_revision":rev+1,"new_epoch":epoch+1,"request":input});
+    Ok((input, summary))
+}
+
+fn check_transferable(rev: i64, epoch: i64, status: &str) -> Result<()> {
+    if matches!(status, "completed" | "abandoned")
+        || rev >= 9007199254740991
+        || epoch >= 9007199254740991
+    {
+        return Err(DomainError::invalid("终态或版本上限不允许转交"));
+    }
+    Ok(())
+}
+
 pub fn transfer(store: &Store, input: TransferInput, confirmed: bool) -> Result<Value> {
     if !confirmed {
         return Err(DomainError::new(
@@ -220,32 +272,30 @@ pub fn transfer(store: &Store, input: TransferInput, confirmed: bool) -> Result<
             "目标 workflow 不属于该项目",
         ));
     }
-    let (rev, epoch, status): (i64, i64, String) = tx
+    let (rev, epoch, status, owner): (i64, i64, String, Option<String>) = tx
         .query_row(
-            "SELECT revision,ownership_epoch,status FROM tasks WHERE project_id=?1 AND id=?2",
+            "SELECT revision,ownership_epoch,status,owner_workflow_id FROM tasks WHERE project_id=?1 AND id=?2",
             params![input.project_id.0, input.task_id.0],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?
         .ok_or_else(|| DomainError::new(ErrorCode::NotFound, "任务不存在"))?;
+    if epoch != input.expected_epoch.0 {
+        return Err(DomainError::ownership_changed(
+            "管理转交 epoch 冲突",
+            &input.task_id.0,
+            rev,
+            epoch,
+            owner.as_deref(),
+        ));
+    }
     if rev != input.expected_revision.0 {
         return Err(DomainError::new(
             ErrorCode::VersionConflict,
             "管理转交 revision 冲突",
         ));
     }
-    if epoch != input.expected_epoch.0 {
-        return Err(DomainError::new(
-            ErrorCode::OwnershipChanged,
-            "管理转交 epoch 冲突",
-        ));
-    }
-    if matches!(status.as_str(), "completed" | "abandoned")
-        || rev >= 9007199254740991
-        || epoch >= 9007199254740991
-    {
-        return Err(DomainError::invalid("终态或版本上限不允许转交"));
-    }
+    check_transferable(rev, epoch, &status)?;
     let n=tx.execute("UPDATE tasks SET owner_workflow_id=?1,revision=?2,ownership_epoch=?3 WHERE project_id=?4 AND id=?5 AND revision=?6 AND ownership_epoch=?7",params![input.target_workflow_id.0,rev+1,epoch+1,input.project_id.0,input.task_id.0,rev,epoch])?;
     if n != 1 {
         return Err(DomainError::new(

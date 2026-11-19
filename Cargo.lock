@@ -653,6 +653,7 @@ version = "0.1.1"
 dependencies = [
  "chrono",
  "jieba-rs",
+ "libc",
  "rmcp",
  "rusqlite",
  "schemars",

@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 pub const APPLICATION_ID: i64 = 0x52544e58;
 #[derive(Clone)]
 pub struct Store {
@@ -78,7 +78,7 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations VALUES(2,?1)", [util::now()])?;
             tx.pragma_update(None, "user_version", 2)?;
         }
-        migrate_identity(&tx)?;
+        migrate_after_search(&tx)?;
         tx.commit()?;
         drop(conn);
         crate::search::rebuild(&store, false)?;
@@ -106,7 +106,7 @@ impl Store {
         Ok(c)
     }
 }
-pub(crate) fn migrate_identity(c: &Connection) -> Result<()> {
+pub(crate) fn migrate_after_search(c: &Connection) -> Result<()> {
     let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version == 2 {
         c.execute_batch(include_str!("../migrations/003_project_identity.sql"))?;
@@ -114,7 +114,15 @@ pub(crate) fn migrate_identity(c: &Connection) -> Result<()> {
             "INSERT INTO schema_migrations(version,applied_at) VALUES(3,?1)",
             [util::now()],
         )?;
-        c.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        c.pragma_update(None, "user_version", 3)?;
+    }
+    if (2..=3).contains(&version) {
+        c.execute_batch(include_str!("../migrations/004_stdio_process.sql"))?;
+        c.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(4,?1)",
+            [util::now()],
+        )?;
+        c.pragma_update(None, "user_version", 4)?;
     }
     Ok(())
 }

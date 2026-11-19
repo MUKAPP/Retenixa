@@ -16,7 +16,7 @@ pub struct RetenixaServer {
 impl RetenixaServer {
     pub fn new(store: Store, host: Option<HostAttachment>) -> Self {
         Self {
-            service: Service::new(store, host),
+            service: Service::for_stdio(store, host),
         }
     }
     #[tool(
@@ -60,7 +60,7 @@ impl RetenixaServer {
             Err(error) => failure(error),
         }
     }
-    #[tool(description="只读恢复选定完整快照、当时固定依据及当前变化；不认领、不执行历史命令",output_schema=rmcp::handler::server::tool::schema_for_output::<ResumePackage>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
+    #[tool(description="只读恢复选定检查点、固定依据及当前变化；按 view 和单份 JSON 字节预算返回，查看 omitted_sections；不认领、不执行历史命令",output_schema=rmcp::handler::server::tool::schema_for_output::<ResumePackage>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
     async fn context_resume(
         &self,
         Parameters(input): Parameters<ContextResumeInput>,
@@ -77,10 +77,17 @@ impl RetenixaServer {
             Err(error) => failure(error),
         }
     }
-    #[tool(description="原子认领无所有者任务；其他 workflow 转交必须管理确认",output_schema=receipt_output_schema(),annotations(read_only_hint=false,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
+    #[tool(description="原子认领无主任务；普通本机 stdio 也可接管已确认退出的普通 stdio 所有者，其余须明确管理转交",output_schema=receipt_output_schema(),annotations(read_only_hint=false,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
     async fn task_claim(&self, Parameters(input): Parameters<TaskClaimInput>) -> CallToolResult {
         match util::json(&input) {
             Ok(value) => self.dispatch("task_claim", value).await,
+            Err(error) => failure(error),
+        }
+    }
+    #[tool(description="由当前所有者显式释放非终态任务；更新 revision/epoch，其他工作流可重新认领",output_schema=receipt_output_schema(),annotations(read_only_hint=false,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
+    async fn task_release(&self, Parameters(input): Parameters<TaskClaimInput>) -> CallToolResult {
+        match util::json(&input) {
+            Ok(value) => self.dispatch("task_release", value).await,
             Err(error) => failure(error),
         }
     }

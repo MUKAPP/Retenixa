@@ -2,7 +2,7 @@
 
 **基于本地 SQLite 的 MCP 项目记忆服务，面向多客户端与多 Git worktree 提供可靠的任务接续、版本化知识检索与并发写入协调。**
 
-> 验证平台：**Windows x86_64** ｜ 核心版本：`0.1.1` ｜ DSH 适配插件：`0.1.9` ｜ 协议：[MIT](LICENSE)
+> 验证平台：**Windows x86_64** ｜ 核心版本：`0.1.1` ｜ DSH 适配插件：`0.1.10` ｜ 协议：[MIT](LICENSE)
 
 Retenixa 将任务进度、项目知识、失败经验和交接依据存入本机 SQLite，让不同会话、不同 MCP 客户端共享同一份项目上下文，减少重复调查并保留可追溯的工作依据。恢复任务时，同时返回**保存时的上下文**与**当前现场变化**（知识版本变更、相关文件变动与未结操作），并通过版本与归属校验防止多 Agent 并发覆盖。
 
@@ -66,7 +66,7 @@ cargo build --release --locked
 - **DSH CLI**（桌面版操作前须先完全退出桌面应用，Web 版将 `desktop` 改为 `web` 或对应 profile 名）：
   ```bash
   # 从 GitHub Release 下载的 .tgz 安装
-  dsh plugin --profile desktop add ./retenixa-dsh-adapter-0.1.9.tgz
+  dsh plugin --profile desktop add ./retenixa-dsh-adapter-0.1.10.tgz
 
   # 或从本地源码目录安装
   dsh plugin --profile desktop add ./adapters/dsh

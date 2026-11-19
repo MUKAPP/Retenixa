@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）的 Retenixa 适配插件，提供持久工作流绑定
 
 | 项目 | 说明 |
 | --- | --- |
-| 插件包名与版本 | `@retenixa/dsh-adapter` `0.1.9` |
+| 插件包名与版本 | `@retenixa/dsh-adapter` `0.1.10` |
 | DSH 兼容范围 | `>=0.2.2-rc.1 <0.3.0-0`（不含 `0.3.0` 预发布版） |
 | 已验收 DSH 版本 | `0.2.2-rc.1`、`0.2.2-rc.2`、`0.2.2-rc.3` |
 | 所需 Retenixa 核心版本 | `0.1.1`（目录转 Git 身份迁移与项目整合依赖此版本） |
@@ -25,7 +25,7 @@ DSH 支持通过原生 **CLI** 或 **GUI** 直接安装 `.tgz` 压缩包或本�
 
 ```bash
 # 安装从 GitHub Releases 下载的 .tgz（Web 版将 desktop 替换为 web 或对应 profile 名）
-dsh plugin --profile desktop add ./retenixa-dsh-adapter-0.1.9.tgz
+dsh plugin --profile desktop add ./retenixa-dsh-adapter-0.1.10.tgz
 
 # 或直接安装本地源码目录（支持绝对路径或 file: 前缀）
 dsh plugin --profile desktop add ./adapters/dsh

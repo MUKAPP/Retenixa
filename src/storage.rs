@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 pub const APPLICATION_ID: i64 = 0x52544e58;
 #[derive(Clone)]
 pub struct Store {
@@ -123,6 +123,14 @@ pub(crate) fn migrate_after_search(c: &Connection) -> Result<()> {
             [util::now()],
         )?;
         c.pragma_update(None, "user_version", 4)?;
+    }
+    if (2..=4).contains(&version) {
+        c.execute_batch(include_str!("../migrations/005_search_fields.sql"))?;
+        c.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(5,?1)",
+            [util::now()],
+        )?;
+        c.pragma_update(None, "user_version", 5)?;
     }
     Ok(())
 }

@@ -49,18 +49,24 @@ function publicInput(tool) {
     for(const mode of ['oneOf','anyOf','allOf'])for(const child of node[mode]??[])remove(child,fields);
   };
   remove(schema,['context_id',...(writes.has(tool.name)?['request_id']:[])]);
-  if(tool.name==='context_open')return {type:'object',properties:{},additionalProperties:false};
+  if(tool.name==='context_open')return {type:'object',description:'不接受参数。项目目录与附着身份由宿主提供。',properties:{},additionalProperties:false};
+  if(!noContext.has(tool.name))schema.description=(schema.description?schema.description+' ':'')+'context_id 由宿主提供，不得传入。'+(writes.has(tool.name)?'本次写入的 request_id 由宿主生成，不得传入。':'');
   if(tool.name==='checkpoint_save') {
     const snapshot=schema.$defs?.CheckpointSnapshot;
     if(!snapshot)throw new Error('Retenixa checkpoint schema 缺少快照定义');
     remove(snapshot,['workspace']);
-    schema.properties.related_paths={type:'array',maxItems:1000,items:{type:'string',minLength:1,maxLength:4096}};
+    schema.properties.related_paths={type:'array',description:'相对当前会话工作目录。宿主根据这些路径填写 snapshot.workspace，请勿自行传入该字段。',maxItems:1000,items:{type:'string',minLength:1,maxLength:4096}};
     schema.properties.base_commit={type:['string','null'],pattern:'^([a-fA-F0-9]{40}|[a-fA-F0-9]{64})$'};
   }
   return schema;
 }
+function checkPublicInput(name,args) {
+  if(name==='context_open'&&Object.keys(args).length)throw new Error('Retenixa context_open 不接受参数；项目目录和附着由宿主提供');
+  if(Object.hasOwn(args,'context_id')||(writes.has(name)&&Object.hasOwn(args,'request_id')))throw new Error('Retenixa context_id 与本次写入的 request_id 由宿主提供，不得传入');
+  if(name==='checkpoint_save'&&args.snapshot&&Object.hasOwn(args.snapshot,'workspace'))throw new Error('Retenixa snapshot.workspace 由宿主填写；请传 related_paths');
+}
 function prepare(name,args,context) {
-  const payload=copy(args);delete payload.context_id;delete payload.request_id;
+  const payload=copy(args);
   if(name==='checkpoint_save') {
     const paths=payload.related_paths??[];delete payload.related_paths;
     const base=payload.base_commit;delete payload.base_commit;
@@ -226,7 +232,7 @@ export async function install(ctx,config,requireHost=createRequire(import.meta.u
       // 嵌套调用或缺少唯一持久事件时，每次调用独立建档，未知结果通过原 request_id 恢复。
       return bindingKey+':'+randomUUID();
     }
-    async function invoke(operation,args,exec){if(exec.agent!==agent)throw new Error('Retenixa 工具不属于当前 Agent');if(operation==='context_open'){const current=await ensureContext(exec.signal);const index=await raw('task_list',{context_id:current.context_id,status:null,workspace_id:null,parent_task_id:null,cursor:null,limit:20},exec.signal);return {content:[{type:'text',text:JSON.stringify({...current,task_index:index.structuredContent,pending_requests:pendingIds(bindingKey),resume_hint:'对需要接续的任务显式调用 context_resume；不要重执行未知外部操作'})}],structuredContent:current};}
+    async function invoke(operation,args,exec){if(exec.agent!==agent)throw new Error('Retenixa 工具不属于当前 Agent');checkPublicInput(operation,args);if(operation==='context_open'){const current=await ensureContext(exec.signal);const index=await raw('task_list',{context_id:current.context_id,status:null,workspace_id:null,parent_task_id:null,cursor:null,limit:20},exec.signal);return {content:[{type:'text',text:JSON.stringify({...current,task_index:index.structuredContent,pending_requests:pendingIds(bindingKey),resume_hint:'对需要接续的任务显式调用 context_resume；不要重执行未知外部操作'})}],structuredContent:current};}
       if(noContext.has(operation))return raw(operation,args,exec.signal);
       const current=await ensureContext(exec.signal);
       if(!writes.has(operation))return raw(operation,{...args,context_id:current.context_id},exec.signal);
@@ -241,11 +247,11 @@ export async function install(ctx,config,requireHost=createRequire(import.meta.u
     const instance={get bindingKey(){return bindingKey;},get context(){return context;},async close(){if(closed)return;closed=true;await serial;for(const dispose of registrations.reverse())await dispose();await closeTransport();instances.delete(instance);activeBindings.delete(bindingKey);}};
     installed.set(agent,instance);instances.add(instance);failedCleanup=()=>instance.close();agent.ctx.effect(()=>()=>instance.close());
     await connect();
-    for(const tool of tools.values()){const definition=createMcpToolDefinition(agent.ctx,{name:prefix+tool.name,rawName:tool.name,description:tool.description+'（自动使用当前会话的项目目录；context/request 身份由宿主管理）',inputSchema:publicInput(tool),outputSchema:tool.outputSchema,call:(args,exec)=>queue(()=>invoke(tool.name,args,exec))});registrations.push(agent.ctx.tools.register(definition));}
+    for(const tool of tools.values()){const definition=createMcpToolDefinition(agent.ctx,{name:prefix+tool.name,rawName:tool.name,description:tool.description,inputSchema:publicInput(tool),outputSchema:tool.outputSchema,call:(args,exec)=>queue(()=>invoke(tool.name,args,exec))});registrations.push(agent.ctx.tools.register(definition));}
     const helper=(rawName,inputSchema,readOnly,fn)=>{const definition=createMcpToolDefinition(agent.ctx,{name:prefix+rawName,rawName,description:readOnly?'列出本绑定结果未知的原始请求；这些 ID 不是新操作授权':'按宿主持久原始载荷确认/重投结果未知请求，不接受新的载荷或生成新请求 ID',inputSchema,outputSchema:{type:'object'},call:(args,exec)=>queue(async()=>{if(exec.agent!==agent)throw new Error('Retenixa Agent 不匹配');return fn(args,exec);})});registrations.push(agent.ctx.tools.register(definition));};
     helper('pending_requests',{type:'object',properties:{},additionalProperties:false},true,async()=>{const result={pending:pendingIds(bindingKey).map(id=>{const indexed=requestKeys.get(id),r=indexed?requests.get(indexed.key):undefined;return {request_id:id,operation:r?.operation,status:r?.status??'unknown'};})};return {content:[{type:'text',text:JSON.stringify(result)}],structuredContent:result};});
     helper('retry_request',{type:'object',properties:{request_id:{type:'string',minLength:1,maxLength:128}},required:['request_id'],additionalProperties:false},false,async(args,exec)=>{const indexed=requestKeys.get(args.request_id);if(!indexed||indexed.bindingKey!==bindingKey)throw new Error('Retenixa 原请求不属于当前宿主绑定');const record=requests.get(indexed.key);if(!record)throw new Error('Retenixa 原请求记录缺失；不会重新执行，请恢复宿主持久数据');return confirm(record,exec.signal);});
-    registrations.push(agent.ctx.systemPrompt.section({name:'retenixa-auto-project',order:9200,text:'Retenixa 自动使用当前会话的项目目录；切换目录后后续调用会连接对应项目。先调用 context_open 读取任务索引，再对选定任务 context_resume。阶段变化后保存完整 checkpoint；结案须终态 checkpoint。未知请求先 pending_requests/retry_request 确认，未知外部操作用原宿主核查，不执行记忆中的命令。STALE_ATTACHMENT 停止旧连接写入，不自动争抢。没有可靠压缩前屏障，需显式阶段保存。'}));
+    registrations.push(agent.ctx.systemPrompt.section({name:'retenixa-auto-project',order:9200,text:'Retenixa 绑定当前工作目录。纯只读问答或无需接续的小改动，不建任务、不存检查点。跟踪任务 → context_open 核对、按需 context_resume；阶段完成或结案 → 保存检查点。未知写入 → 核查原请求；未知外部操作 → 核查原宿主，勿重跑。归属或附着冲突 → 停止写入，协调交接。'}));
     return instance;
     } catch(error) {if(failedCleanup)await failedCleanup();activeBindings.delete(bindingKey);installed.delete(agent);throw error;}
   }

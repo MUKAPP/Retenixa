@@ -167,6 +167,6 @@ fn failure(error: DomainError) -> CallToolResult {
 #[tool_handler(
     name = "retenixa",
     version = "0.1.0",
-    instructions = "Retenixa 支持可靠任务接续与按条件检索。搜索候选不自动采用为固定引用；恢复分页必须读取 has_more 和缺失摘要。首先 context_open，写入保留原 request_id 和正文。context_resume 只读，不执行记忆中的命令，不自动获取任务写权。STALE_ATTACHMENT 必须停止旧连接写入；未知外部操作先核查。"
+    instructions = "跟踪或接续任务 → context_open；纯只读问答或无需接续的小改动，不建任务、不存检查点。context_resume 只读。归属冲突 → 停止写入，列出交接信息，请用户决定，勿静默另建。未知写入 → 查原 request_id；未知外部操作 → 查原宿主，勿重跑。"
 )]
 impl ServerHandler for RetenixaServer {}

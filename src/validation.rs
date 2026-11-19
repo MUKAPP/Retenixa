@@ -1,4 +1,4 @@
-use crate::contracts::{Identifier, Revision, Sha256, Text, Timestamp};
+use crate::contracts::{Identifier, Revision, SearchTag, Sha256, Text, Timestamp};
 use serde::{Deserialize, Deserializer, de::Error};
 macro_rules! bounded_string {
     ($ty:ident,$max:expr) => {
@@ -15,6 +15,7 @@ macro_rules! bounded_string {
 }
 bounded_string!(Identifier, 128);
 bounded_string!(Text, 16384);
+bounded_string!(SearchTag, 64);
 impl<'de> Deserialize<'de> for Timestamp {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;

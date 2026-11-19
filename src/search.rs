@@ -4,7 +4,10 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::LazyLock};
-pub const TOKENIZER_VERSION: &str = "jieba-rs-0.11.0-default-search-hmm0-ident-v1";
+pub const TOKENIZER_VERSION: &str = "jieba-rs-0.11.0-default-search-hmm0-ident-fields-v2";
+pub const RANKING_VERSION: &str = "strict-path-weights-v1";
+/// FTS columns: body, key, conditions, tags.
+pub const BM25: &str = "bm25(search_fts, 1.0, 8.0, 4.0, 2.0)";
 static JIEBA: LazyLock<Jieba> = LazyLock::new(Jieba::new);
 pub fn tokenize(text: &str) -> String {
     let mut terms = BTreeSet::new();
@@ -14,7 +17,11 @@ pub fn tokenize(text: &str) -> String {
             terms.insert(t);
         }
     }
-    for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+    // Jieba emits Han terms. Split at Han boundaries so adjacent identifiers still get segmented.
+    for word in text.split(|c: char| {
+        (!c.is_alphanumeric() && c != '_')
+            || matches!(c, '\u{3400}'..='\u{9fff}' | '\u{20000}'..='\u{323af}')
+    }) {
         if word.is_empty() {
             continue;
         }
@@ -45,19 +52,115 @@ pub fn tokenize(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-pub fn fts_query(query: &str) -> Option<String> {
-    let terms = tokenize(query);
-    let pieces = terms
+fn is_stop_word(term: &str) -> bool {
+    matches!(
+        term,
+        "a" | "an"
+            | "the"
+            | "to"
+            | "of"
+            | "for"
+            | "in"
+            | "on"
+            | "at"
+            | "by"
+            | "from"
+            | "and"
+            | "or"
+            | "not"
+            | "with"
+            | "as"
+            | "is"
+            | "are"
+            | "was"
+            | "be"
+            | "it"
+            | "this"
+            | "that"
+            | "what"
+            | "how"
+            | "why"
+            | "can"
+            | "could"
+            | "should"
+            | "please"
+            | "fn"
+            | "let"
+            | "mut"
+            | "const"
+            | "var"
+            | "pub"
+            | "use"
+            | "impl"
+            | "self"
+            | "import"
+            | "export"
+            | "def"
+            | "function"
+            | "return"
+            | "async"
+            | "await"
+            | "true"
+            | "false"
+            | "的"
+            | "了"
+            | "是"
+            | "在"
+            | "和"
+            | "与"
+            | "或"
+            | "及"
+            | "把"
+            | "被"
+            | "我"
+            | "你"
+            | "有"
+            | "为"
+            | "如何"
+            | "怎么"
+            | "为什么"
+            | "是否"
+            | "什么"
+            | "请"
+            | "这个"
+            | "那个"
+            | "一下"
+            | "一个"
+            | "可以"
+            | "需要"
+            | "进行"
+            | "使用"
+    )
+}
+
+fn quote_terms(tokens: &str, filter_stop_words: bool) -> Vec<String> {
+    let terms: Vec<_> = tokens
         .split_whitespace()
         .filter(|s| s.chars().any(char::is_alphanumeric))
-        .map(|s| format!("\"{}\"", s.replace('"', r#""""#)))
-        .collect::<Vec<_>>();
-    if pieces.is_empty() {
-        None
-    } else {
-        Some(pieces.join(" OR "))
-    }
+        .collect();
+    // A stop word can be intentional by itself (for example, Rust's fn).
+    let filter = filter_stop_words && terms.len() > 1;
+    terms
+        .into_iter()
+        .filter(|term| !filter || !is_stop_word(term))
+        .map(|term| format!("\"{}\"", term.replace('"', r#""""#)))
+        .collect()
 }
+
+pub fn query_terms(query: &str) -> Vec<String> {
+    quote_terms(&tokenize(query), true)
+}
+
+pub fn fts_query(query: &str) -> Option<String> {
+    let tokens = tokenize(query);
+    let mut terms = quote_terms(&tokens, true);
+    if terms.is_empty() {
+        // Blockers are saved symptoms; preserve recall when they contain only stop words.
+        terms = quote_terms(&tokens, false);
+    }
+    (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
 #[derive(Clone)]
 pub struct Document {
     pub project: String,
@@ -73,30 +176,43 @@ pub struct Document {
     pub body: Value,
     pub text: String,
     pub paths: Vec<String>,
-    pub tokens: String,
+    tokens: [String; 4],
 }
-fn body_text(key: &str, claim: &str, conditions: &Value) -> String {
-    format!("{key} {claim} {conditions}")
+fn terms_for_values(values: &Value) -> String {
+    tokenize(
+        &values
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
+
+impl Document {
+    fn set_tokens(&mut self, body_tokens: Option<String>) {
+        let body = self.body["claim"].as_str().unwrap_or(&self.text);
+        self.tokens = [
+            body_tokens.unwrap_or_else(|| tokenize(body)),
+            self.key.as_deref().map(tokenize).unwrap_or_default(),
+            terms_for_values(&self.conditions),
+            terms_for_values(&self.body["metadata"]["search_tags"]),
+        ];
+    }
+}
+
 pub fn knowledge_document(
     conn: &Connection,
     project: &str,
     id: &str,
-    tokens: Option<String>,
+    body_tokens: Option<String>,
 ) -> Result<Document> {
     let (key,scope,revision,status,claim,meta):(String,String,i64,String,String,String)=conn.query_row("SELECT k.key,k.scope_json,k.current_revision,k.status,v.claim,v.metadata_json FROM knowledge k JOIN knowledge_revisions v ON v.project_id=k.project_id AND v.id=k.id AND v.revision=k.current_revision WHERE k.project_id=?1 AND k.id=?2 AND v.claim IS NOT NULL",params![project,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
     let scope: Value = serde_json::from_str(&scope)?;
     let conditions = scope["conditions"].clone();
-    let text = body_text(&key, &claim, &conditions);
-    let tokens = match tokens {
-        Some(t) => t,
-        None => conn.query_row(
-            "SELECT tokenized FROM search_documents WHERE project_id=?1 AND doc_id=?2",
-            params![project, id],
-            |r| r.get(0),
-        )?,
-    };
-    Ok(Document {
+    let text = format!("{key} {claim}");
+    let mut doc = Document {
         project: project.into(),
         id: id.into(),
         kind: "knowledge".into(),
@@ -113,41 +229,18 @@ pub fn knowledge_document(
             .as_str()
             .map(|p| vec![p.into()])
             .unwrap_or_default(),
-        tokens,
-    })
-}
-pub fn prepare_knowledge(
-    conn: &Connection,
-    project: &str,
-    input: &KnowledgeWriteInput,
-) -> Result<Option<String>> {
-    match input {
-        KnowledgeWriteInput::Propose {
-            key, claim, scope, ..
-        } => Ok(Some(tokenize(&body_text(
-            &key.0,
-            &claim.0,
-            &util::json(&scope.conditions)?,
-        )))),
-        KnowledgeWriteInput::Revise {
-            knowledge_id,
-            claim,
-            ..
-        } => {
-            let (key, scope): (String, String) = conn.query_row(
-                "SELECT key,scope_json FROM knowledge WHERE project_id=?1 AND id=?2",
-                params![project, knowledge_id.0],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            let scope: Value = serde_json::from_str(&scope)?;
-            Ok(Some(tokenize(&body_text(
-                &key,
-                &claim.0,
-                &scope["conditions"],
-            ))))
-        }
-        _ => Ok(None),
+        tokens: Default::default(),
+    };
+    if body_tokens.is_some() {
+        doc.set_tokens(body_tokens);
+    } else {
+        doc.tokens = conn.query_row(
+            "SELECT tokenized,key_tokens,condition_tokens,tag_tokens FROM search_documents WHERE project_id=?1 AND doc_id=?2",
+            params![project, id],
+            |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]),
+        )?;
     }
+    Ok(doc)
 }
 pub fn attempt_documents(
     project: &str,
@@ -158,7 +251,7 @@ pub fn attempt_documents(
 ) -> Result<Vec<Document>> {
     let mut docs = unindexed_attempt_documents(project, checkpoint, task, revision, snapshot)?;
     for document in &mut docs {
-        document.tokens = tokenize(&document.text);
+        document.set_tokens(None);
     }
     Ok(docs)
 }
@@ -177,14 +270,11 @@ fn unindexed_attempt_documents(
         .map(|(i, a)| {
             let body =
                 json!({"attempt_index":i,"checkpoint_id":checkpoint,"task_id":task,"attempt":a});
-            let text = format!(
-                "{} {} {} {} {}",
-                a.goal.0,
-                a.method.0,
-                a.result.0,
-                serde_json::to_string(&a.reason)?,
-                serde_json::to_string(&a.conditions)?
-            );
+            let reason = match &a.reason {
+                Observed::Known { value } => &value.0,
+                Observed::Unknown { reason } => &reason.0,
+            };
+            let text = format!("{} {} {} {}", a.goal.0, a.method.0, a.result.0, reason);
             Ok(Document {
                 project: project.into(),
                 id: format!("{checkpoint}:attempt:{i}"),
@@ -209,7 +299,7 @@ fn unindexed_attempt_documents(
                     .iter()
                     .map(|p| p.path.0.replace('\\', "/"))
                     .collect(),
-                tokens: String::new(),
+                tokens: Default::default(),
             })
         })
         .collect()
@@ -219,7 +309,7 @@ pub fn insert(conn: &Connection, d: &Document) -> Result<()> {
         "DELETE FROM search_documents WHERE project_id=?1 AND doc_id=?2",
         params![d.project, d.id],
     )?;
-    conn.execute("INSERT INTO search_documents(project_id,doc_id,kind,entity_id,revision,task_id,workspace_id,key,status,conditions_json,body_json,body_text,tokenized) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![d.project,d.id,d.kind,d.entity,d.revision,d.task,d.workspace,d.key,d.status,serde_json::to_string(&d.conditions)?,serde_json::to_string(&d.body)?,d.text,d.tokens])?;
+    conn.execute("INSERT INTO search_documents(project_id,doc_id,kind,entity_id,revision,task_id,workspace_id,key,status,conditions_json,body_json,body_text,tokenized,key_tokens,condition_tokens,tag_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![d.project,d.id,d.kind,d.entity,d.revision,d.task,d.workspace,d.key,d.status,serde_json::to_string(&d.conditions)?,serde_json::to_string(&d.body)?,d.text,d.tokens[0],d.tokens[1],d.tokens[2],d.tokens[3]])?;
     let row = conn.last_insert_rowid();
     for p in &d.paths {
         conn.execute(
@@ -294,8 +384,8 @@ pub fn rebuild(root: &crate::storage::Store, force: bool) -> Result<()> {
             let scope: Value = serde_json::from_str(row[4].as_str().unwrap())?;
             let key = row[3].as_str().unwrap();
             let claim = row[7].as_str().unwrap();
-            let text = body_text(key, claim, &scope["conditions"]);
-            docs.push(Document{project:project.into(),id:id.into(),kind:"knowledge".into(),entity:id.into(),revision:row[5].as_i64().unwrap(),task:None,workspace:scope["workspace_id"].as_str().map(str::to_owned),key:Some(key.into()),status:row[6].as_str().unwrap().into(),conditions:scope["conditions"].clone(),body:json!({"knowledge_id":id,"claim":claim,"scope":scope,"status":row[6],"metadata":serde_json::from_str::<Value>(row[8].as_str().unwrap())?}),tokens:String::new(),text,paths:scope["path_prefix"].as_str().map(|p|vec![p.into()]).unwrap_or_default()});
+            let text = format!("{key} {claim}");
+            docs.push(Document{project:project.into(),id:id.into(),kind:"knowledge".into(),entity:id.into(),revision:row[5].as_i64().unwrap(),task:None,workspace:scope["workspace_id"].as_str().map(str::to_owned),key:Some(key.into()),status:row[6].as_str().unwrap().into(),conditions:scope["conditions"].clone(),body:json!({"knowledge_id":id,"claim":claim,"scope":scope,"status":row[6],"metadata":serde_json::from_str::<Value>(row[8].as_str().unwrap())?}),tokens:Default::default(),text,paths:scope["path_prefix"].as_str().map(|p|vec![p.into()]).unwrap_or_default()});
         } else {
             let snapshot: CheckpointSnapshot = serde_json::from_str(row[5].as_str().unwrap())?;
             docs.extend(unindexed_attempt_documents(
@@ -310,7 +400,7 @@ pub fn rebuild(root: &crate::storage::Store, force: bool) -> Result<()> {
     })?;
     tx.commit()?;
     for document in &mut docs {
-        document.tokens = tokenize(&document.text);
+        document.set_tokens(None);
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     crate::storage::assert_schema(&tx)?;

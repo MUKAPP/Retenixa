@@ -78,6 +78,7 @@ fn error(r: Result<Value, DomainError>, code: ErrorCode) {
 fn chinese_short_english_and_identifier_search_share_tokenizer() {
     let f = Fixture::new();
     let k=f.accept(&f.propose("auth","用户认证失败时调用refreshAccessToken，使用request_id重试。Reconnection memory retains original request.",scope()));
+    f.accept(&f.propose("anothermemo", "refresh independently", scope()));
     for query in [
         "用户认证",
         "refreshAccessToken",
@@ -102,7 +103,13 @@ fn chinese_short_english_and_identifier_search_share_tokenizer() {
         }
         assert_eq!(page["tokenizer_version"], search::TOKENIZER_VERSION);
     }
-    let hit = &f.search("refresh")["results"][0];
+    let page = f.search("refresh");
+    let hit = page["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["entity_id"] == k["knowledge_id"])
+        .unwrap();
     assert_eq!(hit["reference_candidate"]["selection"], "candidate_only");
     assert_eq!(
         hit["reference_candidate"]["requires_explicit_adoption"],
@@ -269,23 +276,158 @@ fn text_query_is_not_fts_syntax_and_cursor_is_bound() {
     error(f.service.call("memory_search", q), ErrorCode::InvalidInput);
 }
 #[test]
-fn bounded_literal_scan_cannot_claim_complete_absence() {
+fn literal_scan_crosses_windows_but_retains_cursor_at_global_cap() {
     let f = Fixture::new();
-    for i in 0..503 {
-        f.propose(&format!("scan-{i}"), "unrelated payload", scope());
-    }
+    let conn = f.service.store.connect().unwrap();
+    conn.execute(r#"
+      WITH RECURSIVE seq(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM seq WHERE i<5002)
+      INSERT INTO search_documents(project_id,doc_id,kind,entity_id,revision,status,conditions_json,body_json,body_text,tokenized)
+      SELECT ?1,printf('doc-%05d',i),'knowledge',printf('doc-%05d',i),1,'active','[]','{}',
+             CASE WHEN i=501 OR i=503 THEN '针' WHEN i=5001 THEN '锚' ELSE 'unrelated payload' END,''
+      FROM seq
+    "#, [f.context["project_id"].as_str().unwrap()]).unwrap();
+    let mut q = f.search_input("针");
+    q["limit"] = json!(1);
+    let first = call(&f.service, "memory_search", q.clone());
+    assert_eq!(first["results"][0]["id"], "doc-00501");
+    assert_eq!(first["literal_scan_count"], 503);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["scan_limit_reached"], false);
+    q["cursor"] = first["next_cursor"].clone();
+    let second = call(&f.service, "memory_search", q);
+    assert_eq!(second["results"][0]["id"], "doc-00503");
+    assert_eq!(second["has_more"], false);
+
     let mut q = f.search_input("锚");
-    q["scope"]["include_inactive"] = json!(true);
     let first = call(&f.service, "memory_search", q.clone());
     assert_eq!(first["scan_limit_reached"], true);
-    assert_eq!(first["literal_scan_count"], 500);
+    assert_eq!(first["literal_scan_count"], 5000);
     assert_eq!(first["has_more"], true);
-    assert!(first["results"].as_array().unwrap().is_empty());
+    assert_eq!(first["results"], json!([]));
     q["cursor"] = first["next_cursor"].clone();
-    let final_page = call(&f.service, "memory_search", q);
-    assert_eq!(final_page["has_more"], false);
-    assert_eq!(final_page["literal_scan_count"], 3);
+    let last = call(&f.service, "memory_search", q);
+    assert_eq!(last["results"][0]["id"], "doc-05001");
+    assert_eq!(last["has_more"], false);
+    assert_eq!(last["literal_scan_count"], 2);
 }
+
+#[test]
+fn strict_first_then_broad_pages_without_stop_word_noise_or_duplicates() {
+    let f = Fixture::new();
+    f.accept(&f.propose(
+        "noise",
+        "please how to use fn let return 如何 使用 一个",
+        scope(),
+    ));
+    let broad = f.accept(&f.propose("one-term", "handshake", scope()));
+    let strict = f.accept(&f.propose("two-terms", "handshake backlog", scope()));
+    let query = "please how to use fn let handshake backlog 如何 使用 一个";
+    let page = f.search(query);
+    assert_eq!(page["results"].as_array().unwrap().len(), 2, "{page}");
+    assert_eq!(page["results"][0]["entity_id"], strict["knowledge_id"]);
+    assert_eq!(page["results"][1]["entity_id"], broad["knowledge_id"]);
+    let mut q = f.search_input(query);
+    q["limit"] = json!(1);
+    let first = call(&f.service, "memory_search", q.clone());
+    assert_eq!(first["results"][0]["entity_id"], strict["knowledge_id"]);
+    q["cursor"] = first["next_cursor"].clone();
+    let second = call(&f.service, "memory_search", q);
+    assert_eq!(second["results"][0]["entity_id"], broad["knowledge_id"]);
+    assert_eq!(second["has_more"], false);
+}
+
+#[test]
+fn ranking_prioritizes_key_condition_and_nearby_paths() {
+    let f = Fixture::new();
+    let scoped = |path: &str| json!({"workspace_id":null,"path_prefix":path,"conditions":[]});
+    let column_body = f.accept(&f.propose("bodymemo", "flushing", scope()));
+    let column_condition = f.accept(&f.propose(
+        "conditionmemo",
+        "unrelated",
+        json!({"workspace_id":null,"path_prefix":null,"conditions":["flushing"]}),
+    ));
+    let column_key = f.accept(&f.propose("flushing-memo", "unrelated", scope()));
+    let page = f.search("flushing");
+    for (r, k) in
+        page["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip([column_key, column_condition, column_body])
+    {
+        assert_eq!(r["entity_id"], k["knowledge_id"], "{page}");
+    }
+    let exact = f.accept(&f.propose("exactpath", "unrelated", scoped("src/auth/login.rs")));
+    let parent = f.accept(&f.propose("parentpath", "src auth login rs", scoped("src/auth")));
+    let sibling = f.accept(&f.propose(
+        "siblingpath",
+        "src auth login rs",
+        scoped("src/auth/other.rs"),
+    ));
+    let nonmatching = f.accept(&f.propose("globalpath", "src auth login rs", scope()));
+    let page = f.search(r"src\auth\login.rs");
+    let ids: Vec<_> = page["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| &r["entity_id"])
+        .collect();
+    assert_eq!(ids[0], &exact["knowledge_id"], "{page}");
+    assert!(ids[..3].contains(&&parent["knowledge_id"]));
+    assert!(ids[..3].contains(&&sibling["knowledge_id"]));
+    assert_eq!(ids[3], &nonmatching["knowledge_id"]);
+    let mut q = f.search_input("src auth login rs");
+    q["scope"]["path_prefix"] = json!("src/auth");
+    let page = call(&f.service, "memory_search", q);
+    assert_eq!(page["results"][0]["entity_id"], parent["knowledge_id"]);
+
+    let mut q = f.search_input("src/auth/login.rs");
+    q["scope"]["path_prefix"] = json!("src/auth");
+    let page = call(&f.service, "memory_search", q);
+    assert_eq!(page["results"][0]["entity_id"], exact["knowledge_id"]);
+}
+
+#[test]
+fn knowledge_tags_are_versioned_searchable_and_validated() {
+    let f = Fixture::new();
+    let mut propose = json!({"op":"propose","context_id":f.context["context_id"],"request_id":util::id(),"expected":"absent","key":"tagmemo","claim":"重新建立认证会话","scope":scope(),"evidence_refs":[],"new_evidence":[]});
+    for bad_tags in [
+        json!(["x".repeat(65)]),
+        json!(["  "]),
+        json!(vec!["tag"; 9]),
+    ] {
+        propose["search_tags"] = bad_tags;
+        error(
+            f.service.call("knowledge_write", propose.clone()),
+            ErrorCode::InvalidInput,
+        );
+    }
+    propose["search_tags"] = json!(["redirect spiral", "锚", "x\""]);
+    let result = call(&f.service, "knowledge_write", propose.clone());
+    assert_eq!(
+        call(&f.service, "knowledge_write", propose)["replayed"],
+        true
+    );
+    let mut k = f.accept(&result["result"]["knowledge"]);
+    assert_eq!(f.search("redirect spiral")["results"][0]["revision"], 2);
+    assert_eq!(f.search("锚")["results"][0]["entity_id"], k["knowledge_id"]);
+    assert_eq!(
+        f.search("x\"")["results"][0]["entity_id"],
+        k["knowledge_id"]
+    );
+    let mut revise = json!({"op":"revise","context_id":f.context["context_id"],"request_id":util::id(),"knowledge_id":k["knowledge_id"],"expected_revision":2,"claim":"认证流程第二版","evidence_refs":[],"new_evidence":[],"reason":"例行修订"});
+    k = f.accept(&call(&f.service, "knowledge_write", revise.clone())["result"]["knowledge"]);
+    search::rebuild(&f.service.store, true).unwrap();
+    assert_eq!(f.search("redirect spiral")["results"][0]["revision"], 4);
+    revise["request_id"] = json!(util::id());
+    revise["expected_revision"] = k["revision"].clone();
+    revise["search_tags"] = json!([]);
+    f.accept(&call(&f.service, "knowledge_write", revise)["result"]["knowledge"]);
+    assert_eq!(f.search("redirect spiral")["results"], json!([]));
+    assert_eq!(f.search("锚")["results"], json!([]));
+    assert_eq!(f.search("\"")["results"], json!([]));
+}
+
 #[test]
 fn terminal_search_page_fits_its_actual_wire_budget() {
     let f = Fixture::new();
@@ -425,6 +567,55 @@ fn migration_preserves_authoritative_history_and_rebuilds_search() {
     );
 }
 #[test]
+fn schema_four_rebuilds_existing_documents_into_weighted_columns() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/search-migration")
+        .join(util::id());
+    std::fs::create_dir_all(&root).unwrap();
+    let c = rusqlite::Connection::open(root.join("retenixa.sqlite3")).unwrap();
+    for sql in [
+        include_str!("../migrations/001_kernel.sql"),
+        include_str!("../migrations/002_search.sql"),
+        include_str!("../migrations/003_project_identity.sql"),
+        include_str!("../migrations/004_stdio_process.sql"),
+    ] {
+        c.execute_batch(sql).unwrap();
+    }
+    c.pragma_update(None, "application_id", APPLICATION_ID)
+        .unwrap();
+    c.pragma_update(None, "user_version", 4).unwrap();
+    c.execute("INSERT INTO projects VALUES('p',?1)", [util::now()])
+        .unwrap();
+    c.execute(
+        "INSERT INTO knowledge VALUES('p','k','migratedkey',?1,1,'active')",
+        [json!({"conditions":["offlinemode"]}).to_string()],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO knowledge_revisions VALUES('p','k',1,'legacybody',?1,'active','{}',?2)",
+        rusqlite::params![util::hash("legacybody"), util::now()],
+    )
+    .unwrap();
+    c.execute_batch("INSERT INTO search_documents(project_id,doc_id,kind,entity_id,revision, status,conditions_json,body_json,body_text,tokenized) VALUES('p','k','knowledge','k',1,'active','[]','{}','stale projection','migratedkey offlinemode legacybody'); INSERT INTO search_meta VALUES('tokenizer_version','jieba-rs-0.11.0-default-search-hmm0-ident-v1');").unwrap();
+    drop(c);
+    let store = Store::open(&root).unwrap();
+    let c = store.connect().unwrap();
+    let count: i64 = c.query_row("SELECT count(*) FROM search_fts WHERE search_fts MATCH 'key_tokens:migratedkey condition_tokens:offlinemode tokenized:legacybody'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        c.query_row("SELECT tokenized FROM search_documents", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "legacybody"
+    );
+    c.execute(
+        "INSERT INTO search_fts(search_fts,rank) VALUES('integrity-check',1)",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
 fn complete_single_pin_recovery_fits_exact_logical_budget() {
     let f = Fixture::new();
     let t = f.task();
@@ -502,6 +693,22 @@ fn budgeted_resume_keeps_core_and_pages_fixed_bodies_without_autopin() {
         .unwrap(),
         5
     );
+}
+
+#[test]
+fn recovery_retains_blocker_lexical_matches_when_every_term_is_a_stop_word() {
+    let f = Fixture::new();
+    let k = f.accept(&f.propose("booleanmemo", "函数提前退出时触发 return false", scope()));
+    let task = f.task();
+    let mut snapshot = f.snapshot();
+    snapshot["blockers"] = json!(["return false"]);
+    f.save(&task, snapshot, json!([]));
+    let page = call(
+        &f.service,
+        "context_resume",
+        json!({"context_id":f.context["context_id"],"task_id":task["task_id"],"byte_budget":65536}),
+    );
+    assert_eq!(page["related_context"][0]["id"], k["knowledge_id"]);
 }
 
 #[test]

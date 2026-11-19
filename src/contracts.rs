@@ -187,7 +187,7 @@ pub struct CheckpointSnapshot {
     pub unresolved_operations: Vec<UnresolvedOperation>,
     pub blockers: Vec<Text>,
     pub next_steps: Vec<Text>,
-    /// 固定引用均为空时必须说明原因；由领域服务校验。
+    /// knowledge_refs 和 evidence_refs 均为空时必填，说明本检查点为何没有固定依据。
     pub no_references_reason: Option<Text>,
 }
 
@@ -317,6 +317,7 @@ pub struct MemorySearchInput {
     #[schemars(range(min = 1, max = 50))]
     pub limit: u32,
     pub context_id: Identifier,
+    /// 普通文本。先匹配去停用词后的全部词，再用部分匹配补齐；短词和无 FTS 命中时扫描字面文本。
     #[schemars(length(min = 1, max = 4096))]
     pub query: String,
     pub kind: SearchKind,
@@ -403,6 +404,7 @@ pub struct AcceptanceBasis {
     pub agent_report: Option<Text>,
 }
 
+/// 新证据统一归因为 agent_reported，调用方不能指定 human_confirmed 或 service_observed。
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentEvidenceInput {
@@ -420,6 +422,10 @@ pub enum CreationExpectation {
     Absent,
 }
 
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct SearchTag(#[schemars(length(min = 1, max = 64))] pub String);
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum KnowledgeWriteInput {
@@ -430,6 +436,10 @@ pub enum KnowledgeWriteInput {
         key: Identifier,
         scope: KnowledgeScope,
         claim: Text,
+        /// 最多 8 个同义词或症状标签，只用于检索，不作为证据或适用条件。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 8))]
+        search_tags: Option<Vec<SearchTag>>,
         evidence_refs: Vec<EvidenceReference>,
         new_evidence: Vec<AgentEvidenceInput>,
     },
@@ -446,6 +456,10 @@ pub enum KnowledgeWriteInput {
         knowledge_id: Identifier,
         expected_revision: Revision,
         claim: Text,
+        /// 最多 8 个检索标签。省略则沿用上个版本，空数组清除标签。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 8))]
+        search_tags: Option<Vec<SearchTag>>,
         evidence_refs: Vec<EvidenceReference>,
         new_evidence: Vec<AgentEvidenceInput>,
         reason: Text,
@@ -695,7 +709,7 @@ pub fn catalog() -> ContractCatalog {
         ("task_list".into(), schema::<TaskListInput>()),
     ]);
     ContractCatalog {
-        contract_version: "0.4.0".into(),
+        contract_version: "0.5.0".into(),
         executable_tools: [
             "contract_get",
             "system_doctor",

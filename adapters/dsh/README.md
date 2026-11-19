@@ -78,7 +78,7 @@ console.log(report.status, report.root);
 
 [插件入口](plugin.js) 使用原生 Config 的 volatile 字段和 settings 表单接口，并监听 loader/volatile-update 响应配置值变化；[浏览器入口](client.js) 注册公开 plugins.bundle.config 插槽，在与其他插件相同的位置显示设置，写入带版本检查的 configForms。设置不单独存一份文件。插件空配置可挂载，保存后重建适配器子作用域。
 
-[适配逻辑](index.js) 按各 Agent 作用域注册工具；每次排队调用前检查该会话的当前目录。模型工具隐藏 context_id 和变更 request_id；checkpoint_save 由 related_paths 及可选 base_commit 构造未知现场字段，服务另行观测，Agent 提供语义进展。私有绑定能力不进入模型 schema 或日志。嵌入式 SDK 调用 install(ctx, config, hostRequire) 时仍可显式提供 workspacePath，以支持无工作目录服务的隔离宿主。
+[适配逻辑](index.js) 按各 Agent 作用域注册工具；每次排队调用前检查该会话的当前目录。宿主代填 context_id、变更 request_id 和 snapshot.workspace，工具拒绝调用方传入这些字段。checkpoint_save 使用 related_paths 和可选 base_commit 标注待观测范围，服务另行采集现场。私有绑定能力不进入模型 schema 或日志。嵌入式 SDK 调用 install(ctx, config, hostRequire) 时仍可显式提供 workspacePath，以支持无工作目录服务的隔离宿主。
 
 context_open 读取任务索引；pending_requests 列出待确认的原请求；retry_request 仅确认或重投已持久化的原载荷。STALE_ATTACHMENT 停止旧实例。写入支持原生、PTC 和嵌套调用：能唯一关联持久根工具事件时沿用事件索引，其他调用各自生成独立索引。请求 ID、完整载荷和待确认身份索引全部持久保存成功后，才发送到核心服务。
 

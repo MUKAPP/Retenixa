@@ -7,7 +7,11 @@ const FILTER: &str = r#"d.project_id=:project AND (:kind='all' OR d.kind=:kind)
  AND (:path IS NULL OR NOT EXISTS(SELECT 1 FROM search_document_paths p WHERE p.row_id=d.row_id) OR EXISTS(SELECT 1 FROM search_document_paths p WHERE p.row_id=d.row_id AND (p.path=:path OR substr(p.path,1,length(:path)+1)=:path||'/' OR substr(:path,1,length(p.path)+1)=p.path||'/')))
  AND (:conditions='[]' OR NOT EXISTS(SELECT 1 FROM json_each(d.conditions_json)) OR EXISTS(SELECT 1 FROM json_each(:conditions) wanted JOIN json_each(d.conditions_json) actual ON actual.value=wanted.value))"#;
 const COLUMNS: &str = "d.doc_id,d.kind,d.entity_id,d.revision,d.task_id,d.workspace_id,d.key,d.status,d.conditions_json,d.body_json,d.body_text,(SELECT json_group_array(p.path) FROM search_document_paths p WHERE p.row_id=d.row_id)";
-const LITERAL_COLUMNS: &str = "d.doc_id,d.entity_id,d.key,d.body_text,(SELECT json_group_array(p.path) FROM search_document_paths p WHERE p.row_id=d.row_id)";
+const LITERAL_COLUMNS: &str = "d.doc_id,d.entity_id,d.key,d.body_text,d.conditions_json,json_extract(d.body_json,'$.metadata.search_tags'),(SELECT json_group_array(p.path) FROM search_document_paths p WHERE p.row_id=d.row_id)";
+const LITERAL_WINDOW: usize = 500;
+const LITERAL_SCAN_LIMIT: usize = 5_000;
+const NEAR_PATH: &str = "(substr(p.path,1,length(:rank_path)+1)=:rank_path||'/' OR substr(:rank_path,1,length(p.path)+1)=p.path||'/' OR p.path=:query_dir OR substr(p.path,1,length(:query_dir)+1)=:query_dir||'/')";
+const EXACT_MATCH: &str = "(d.doc_id=:query OR d.entity_id=:query OR coalesce(d.key=:query_lower,0) OR EXISTS(SELECT 1 FROM search_document_paths p WHERE p.row_id=d.row_id AND p.path=:query_path))";
 struct Hit {
     id: String,
     kind: String,
@@ -63,6 +67,12 @@ fn prefix(path: &str) -> Result<String> {
     }
     Ok(value)
 }
+fn literal_array_contains(json: &str, query: &str) -> Result<bool> {
+    Ok(serde_json::from_str::<Vec<String>>(json)?
+        .iter()
+        .any(|value| value.to_lowercase().contains(query)))
+}
+
 fn snippet(text: &str, query: &str) -> String {
     let lower = text.to_lowercase();
     let index = lower.find(&query.to_lowercase()).unwrap_or(0);
@@ -140,7 +150,8 @@ impl Service {
         let mut conn = self.store.connect()?;
         let tx = conn.transaction()?;
         self.access(&tx, context, false)?;
-        let sql = r#"
+        let sql = format!(
+            r#"
             WITH observed(path) AS MATERIALIZED (SELECT value FROM json_each(:paths)),
             pinned(id) AS MATERIALIZED (SELECT value FROM json_each(:pins)),
             fixed_scope(path) AS MATERIALIZED (
@@ -155,7 +166,7 @@ impl Service {
                 SELECT DISTINCT p.row_id FROM fixed_scope JOIN search_document_paths p ON p.path=fixed_scope.path
             ),
             blocker_hits AS MATERIALIZED (
-                SELECT rowid,bm25(search_fts) AS score FROM search_fts
+                SELECT rowid,{} AS score FROM search_fts
                 WHERE :terms IS NOT NULL AND search_fts MATCH coalesce(:terms, '"retenixa_no_terms"')
             ),
             candidates(row_id) AS (
@@ -178,9 +189,11 @@ impl Service {
                 AND (d.workspace_id IS NULL OR d.workspace_id=:saved_workspace OR d.workspace_id=:current_workspace)
                 AND d.entity_id NOT IN (SELECT id FROM pinned)
             ORDER BY priority, applicable DESC, coalesce(b.score,0), d.entity_id LIMIT :limit
-        "#;
+        "#,
+            search::BM25
+        );
         let mut hits = {
-            let mut stmt = tx.prepare(sql)?;
+            let mut stmt = tx.prepare(&sql)?;
             stmt.query_map(rusqlite::named_params! {
                 ":paths": serde_json::to_string(&paths)?,
                 ":pins": serde_json::to_string(&pins.iter().map(|p| &p.knowledge_id).collect::<Vec<_>>())?,
@@ -224,11 +237,8 @@ impl Service {
             .transpose()?;
         input.scope.conditions.sort_by(|a, b| a.0.cmp(&b.0));
         input.scope.conditions.dedup_by(|a, b| a.0 == b.0);
-        let query_tokens = search::fts_query(&input.query);
-        if query_tokens
-            .as_ref()
-            .is_some_and(|s| s.split(" OR ").count() > 256)
-        {
+        let terms = search::query_terms(&input.query);
+        if terms.len() > 256 {
             return Err(DomainError::invalid("搜索分词超过 256 项，请缩短查询"));
         }
         let mut conn = self.store.connect()?;
@@ -258,9 +268,15 @@ impl Service {
         let kind = kind.as_str().unwrap();
         let conditions = serde_json::to_string(&input.scope.conditions)?;
         let fingerprint = util::hash(util::canonical(
-            &json!({"project":a.project,"workspace":workspace,"query":input.query,"kind":kind,"scope":input.scope,"path":requested_path,"tokenizer":search::TOKENIZER_VERSION}),
+            &json!({"project":a.project,"workspace":workspace,"query":input.query,"kind":kind,"scope":input.scope,"path":requested_path,"tokenizer":search::TOKENIZER_VERSION,"ranking":search::RANKING_VERSION}),
         )?);
-        let mut mode = if input.query.chars().count() <= 2 || query_tokens.is_none() {
+        let query_lower = input.query.to_lowercase();
+        let query_path = prefix(&input.query).ok();
+        let query_dir = query_path
+            .as_deref()
+            .and_then(|p| p.rsplit_once('/').map(|(dir, _)| dir));
+        let rank_path = requested_path.as_deref().or(query_path.as_deref());
+        let mut mode = if input.query.chars().count() <= 2 || terms.is_empty() {
             "literal"
         } else {
             "fts"
@@ -279,53 +295,101 @@ impl Service {
                 .filter(|offset| *offset >= 0)
                 .ok_or_else(|| DomainError::invalid("cursor 位置必须为非负 64 位整数"))?;
             after = util::text(&c, "after");
-            if !matches!(mode.as_str(), "literal" | "fts") {
+            if !matches!(mode.as_str(), "literal" | "fts" | "fts_broad")
+                || (mode == "fts_broad" && terms.len() < 2)
+                || (mode != "literal" && terms.is_empty())
+            {
                 return Err(DomainError::invalid("cursor 模式或位置无效"));
             }
         }
+        let page_cursor = |mode: &str, offset: i64, after: &str| {
+            util::cursor(&json!({"filter":fingerprint,"mode":mode,"offset":offset,"after":after}))
+        };
+        let wanted = input.limit as usize + 1;
         let mut results = Vec::new();
         let mut next = None;
         let mut scanned = 0usize;
         let mut capped = false;
-        let mut method = mode.clone();
-        if mode == "fts" {
-            let sql = format!(
-                "WITH matched AS MATERIALIZED (SELECT rowid,bm25(search_fts) AS score FROM search_fts WHERE search_fts MATCH :match) SELECT {COLUMNS} FROM search_documents d LEFT JOIN matched m ON m.rowid=d.row_id WHERE {FILTER} AND (m.rowid IS NOT NULL OR d.doc_id=:query OR d.entity_id=:query OR d.key=lower(:query) OR EXISTS(SELECT 1 FROM search_document_paths p WHERE p.row_id=d.row_id AND p.path=:query)) ORDER BY CASE WHEN d.doc_id=:query OR d.entity_id=:query OR d.key=lower(:query) THEN 0 ELSE 1 END,coalesce(m.score,0),d.doc_id LIMIT :limit OFFSET :offset"
-            );
-            let mut stmt = tx.prepare(&sql)?;
-            let rows=stmt.query_map(rusqlite::named_params!{":project":a.project,":kind":kind,":inactive":input.scope.include_inactive,":workspace":workspace,":task":input.scope.task_id.as_ref().map(|t|&t.0),":path":requested_path,":conditions":conditions,":match":query_tokens.as_deref().unwrap_or("no_query_terms"),":query":input.query,":limit":input.limit+1,":offset":offset},row)?.collect::<std::result::Result<Vec<_>,_>>()?;
-            if rows.is_empty() && input.cursor.is_none() {
+        let mut method = "literal";
+        if mode != "literal" {
+            let strict = terms.join(" AND ");
+            let fts_page = |broad: bool, take: usize, skip: i64| -> Result<Vec<_>> {
+                let stage = if broad { "fts_broad" } else { "fts" };
+                let search_terms = if broad {
+                    terms.join(" OR ")
+                } else {
+                    strict.clone()
+                };
+                let sql = format!(
+                    r#"
+                    WITH matched AS MATERIALIZED (
+                        SELECT search_fts.rowid,{} AS score FROM search_fts
+                        JOIN search_documents sd ON sd.row_id=search_fts.rowid
+                        WHERE search_fts MATCH :match AND sd.project_id=:project
+                    ), candidates(rowid) AS (
+                        SELECT rowid FROM matched
+                        UNION SELECT row_id FROM search_documents WHERE :broad=0 AND project_id=:project AND doc_id=:query
+                        UNION SELECT row_id FROM search_documents WHERE :broad=0 AND project_id=:project AND entity_id=:query
+                        UNION SELECT row_id FROM search_documents WHERE :broad=0 AND project_id=:project AND key=:query_lower
+                        UNION SELECT row_id FROM search_document_paths WHERE :broad=0 AND path=:query_path
+                    )
+                    SELECT {COLUMNS} FROM candidates c JOIN search_documents d ON d.row_id=c.rowid
+                        LEFT JOIN matched m ON m.rowid=c.rowid
+                    WHERE {FILTER}
+                        AND (:broad=0 OR (NOT {EXACT_MATCH} AND d.row_id NOT IN (
+                            SELECT rowid FROM search_fts WHERE search_fts MATCH :strict)))
+                    ORDER BY (d.doc_id=:query OR d.entity_id=:query OR coalesce(d.key=:query_lower,0)) DESC,
+                        coalesce((SELECT max(CASE WHEN p.path=:query_path THEN 3
+                             WHEN p.path=:rank_path THEN 2 WHEN {NEAR_PATH} THEN 1 ELSE 0 END)
+                         FROM search_document_paths p WHERE p.row_id=d.row_id),0) DESC,
+                        coalesce(m.score,0), d.doc_id LIMIT :limit OFFSET :offset
+                "#,
+                    search::BM25
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::named_params! {
+                    ":project":a.project, ":kind":kind, ":inactive":input.scope.include_inactive,
+                    ":workspace":workspace, ":task":input.scope.task_id.as_ref().map(|t|&t.0),
+                    ":path":requested_path, ":conditions":conditions, ":match":search_terms,
+                    ":query":input.query, ":query_lower":query_lower, ":query_path":query_path,
+                    ":query_dir":query_dir, ":rank_path":rank_path, ":limit":take as i64,
+                    ":offset":skip, ":broad":broad, ":strict":strict,
+                }, row)?;
+                rows.enumerate()
+                    .map(|(i, hit)| {
+                        let pos = skip.checked_add(i as i64 + 1).ok_or_else(|| {
+                            DomainError::invalid("cursor 位置超出 SQLite OFFSET 范围")
+                        })?;
+                        Ok((hit?, stage, pos))
+                    })
+                    .collect()
+            };
+            let mut hits = fts_page(mode == "fts_broad", wanted, offset)?;
+            // One extra hit establishes whether a continuation exists.
+            if mode == "fts" && hits.len() < wanted && terms.len() > 1 {
+                hits.extend(fts_page(true, wanted - hits.len(), 0)?);
+            }
+            if hits.is_empty() && input.cursor.is_none() {
                 mode = "literal".into();
-                method = "literal_fallback".into();
+                method = "literal_fallback";
             } else {
-                let mut used = 0;
-                let mut position = offset;
-                for hit in rows.iter().take(input.limit as usize) {
+                method = "fts_or_exact";
+                for (i, (hit, stage, pos)) in hits.iter().take(input.limit as usize).enumerate() {
+                    let candidate = hits
+                        .get(i + 1)
+                        .map(|(_, next_stage, _)| {
+                            page_cursor(next_stage, if next_stage == stage { *pos } else { 0 }, "")
+                        })
+                        .transpose()?;
                     results.push(render(
                         hit,
                         &input.query,
-                        "fts_or_exact",
+                        method,
                         &input.scope.conditions,
                         requested_path.as_deref(),
                     ));
-                    let next_position = position.checked_add(1).ok_or_else(|| {
-                        DomainError::invalid("cursor 位置超出 SQLite OFFSET 范围")
-                    })?;
-                    let c = util::cursor(
-                        &json!({"filter":fingerprint,"mode":"fts","offset":next_position,"after":""}),
-                    )?;
                     if let Err(e) = util::budget(
-                        response(
-                            &results,
-                            if ((used + 1) as usize) < rows.len() {
-                                Some(&c)
-                            } else {
-                                None
-                            },
-                            "fts_or_exact",
-                            0,
-                            false,
-                        ),
+                        response(&results, candidate.as_deref(), method, 0, false),
                         input.byte_budget,
                         Some(hit.entity.clone()),
                     ) {
@@ -335,51 +399,70 @@ impl Service {
                         }
                         break;
                     }
-                    used += 1;
-                    position = next_position;
+                    next = candidate;
                 }
-                if rows.len() > used as usize {
-                    next = Some(util::cursor(
-                        &json!({"filter":fingerprint,"mode":"fts","offset":position,"after":""}),
-                    )?);
-                }
-                method = "fts_or_exact".into();
             }
         }
         if mode == "literal" {
+            if input.cursor.is_some() && input.query.chars().count() > 2 && !terms.is_empty() {
+                method = "literal_fallback";
+            }
             let sql = format!(
-                "SELECT {LITERAL_COLUMNS} FROM search_documents d WHERE {FILTER} AND d.doc_id>:after ORDER BY d.doc_id LIMIT 501"
+                "SELECT {LITERAL_COLUMNS} FROM search_documents d WHERE {FILTER} AND d.doc_id>:after ORDER BY d.doc_id LIMIT :window"
             );
-            let query = input.query.to_lowercase();
-            let query_path = prefix(&input.query).ok();
             let mut matches = Vec::new();
-            let mut last_scanned = String::new();
-            {
-                let mut stmt = tx.prepare(&sql)?;
-                let mut rows = stmt.query(rusqlite::named_params!{":project":a.project,":kind":kind,":inactive":input.scope.include_inactive,":workspace":workspace,":task":input.scope.task_id.as_ref().map(|t|&t.0),":path":requested_path,":conditions":conditions,":after":after})?;
+            let mut last_scanned = after;
+            let mut stmt = tx.prepare(&sql)?;
+            'windows: loop {
+                let mut rows = stmt.query(rusqlite::named_params! {
+                    ":project":a.project, ":kind":kind, ":inactive":input.scope.include_inactive,
+                    ":workspace":workspace, ":task":input.scope.task_id.as_ref().map(|t|&t.0),
+                    ":path":requested_path, ":conditions":conditions, ":after":last_scanned,
+                    ":window":LITERAL_WINDOW as i64 + 1,
+                })?;
+                let mut window_scanned = 0;
                 while let Some(candidate) = rows.next()? {
-                    if scanned == 500 {
+                    if scanned == LITERAL_SCAN_LIMIT {
                         capped = true;
-                        break;
+                        break 'windows;
+                    }
+                    if window_scanned == LITERAL_WINDOW {
+                        continue 'windows;
                     }
                     scanned += 1;
+                    window_scanned += 1;
                     let id: String = candidate.get(0)?;
                     let entity: String = candidate.get(1)?;
                     let key: Option<String> = candidate.get(2)?;
                     let text: String = candidate.get(3)?;
-                    let paths: Vec<String> = serde_json::from_str(&candidate.get::<_, String>(4)?)?;
+                    let conditions_text: String = candidate.get(4)?;
+                    let tags: Option<String> = candidate.get(5)?;
+                    let paths: Vec<String> = serde_json::from_str(&candidate.get::<_, String>(6)?)?;
                     last_scanned.clone_from(&id);
-                    if text.to_lowercase().contains(&query)
+                    if text.to_lowercase().contains(&query_lower)
+                        || literal_array_contains(&conditions_text, &query_lower)?
+                        || tags
+                            .as_deref()
+                            .map(|tags| literal_array_contains(tags, &query_lower))
+                            .transpose()?
+                            .unwrap_or(false)
                         || id == input.query
                         || entity == input.query
-                        || key.as_deref() == Some(query.as_str())
+                        || key.as_deref() == Some(query_lower.as_str())
                         || paths
                             .iter()
                             .any(|p| p == &input.query || query_path.as_ref() == Some(p))
                     {
                         matches.push(id);
+                        if matches.len() == wanted {
+                            break 'windows;
+                        }
                     }
                 }
+                break;
+            }
+            if matches.is_empty() && capped {
+                next = Some(page_cursor("literal", 0, &last_scanned)?);
             }
             let full_sql = format!(
                 "SELECT {COLUMNS} FROM search_documents d WHERE d.project_id=?1 AND d.doc_id=?2"
@@ -390,25 +473,19 @@ impl Service {
                 results.push(render(
                     &hit,
                     &input.query,
-                    &method,
+                    method,
                     &input.scope.conditions,
                     requested_path.as_deref(),
                 ));
-                let remaining = index + 1 < matches.len() || capped;
-                let after = if index + 1 == matches.len() && capped {
-                    last_scanned.as_str()
-                } else {
-                    hit.id.as_str()
-                };
-                let candidate = if remaining {
-                    Some(util::cursor(
-                        &json!({"filter":fingerprint,"mode":"literal","offset":0,"after":after}),
-                    )?)
+                let candidate = if index + 1 < matches.len() {
+                    Some(page_cursor("literal", 0, id)?)
+                } else if capped {
+                    Some(page_cursor("literal", 0, &last_scanned)?)
                 } else {
                     None
                 };
                 if let Err(error) = util::budget(
-                    response(&results, candidate.as_deref(), &method, scanned, capped),
+                    response(&results, candidate.as_deref(), method, scanned, capped),
                     input.byte_budget,
                     Some(hit.entity.clone()),
                 ) {
@@ -418,20 +495,11 @@ impl Service {
                     }
                     break;
                 }
-            }
-            if results.len() < matches.len() {
-                let after = &matches[results.len() - 1];
-                next = Some(util::cursor(
-                    &json!({"filter":fingerprint,"mode":"literal","offset":0,"after":after}),
-                )?);
-            } else if capped {
-                next = Some(util::cursor(
-                    &json!({"filter":fingerprint,"mode":"literal","offset":0,"after":last_scanned}),
-                )?);
+                next = candidate;
             }
         }
         let output = util::budget(
-            response(&results, next.as_deref(), &method, scanned, capped),
+            response(&results, next.as_deref(), method, scanned, capped),
             input.byte_budget,
             None,
         )?;
@@ -446,5 +514,5 @@ fn response(
     scanned: usize,
     capped: bool,
 ) -> Value {
-    json!({"results":results,"has_more":cursor.is_some(),"next_cursor":cursor,"omitted_categories":[],"search_method":method,"literal_scan_count":scanned,"literal_scan_limit":500,"scan_limit_reached":capped,"tokenizer_version":search::TOKENIZER_VERSION,"view":"live; concurrent revisions may change ordering; deduplicate by id+revision"})
+    json!({"results":results,"has_more":cursor.is_some(),"next_cursor":cursor,"omitted_categories":[],"search_method":method,"literal_scan_count":scanned,"literal_scan_limit":LITERAL_SCAN_LIMIT,"scan_limit_reached":capped,"tokenizer_version":search::TOKENIZER_VERSION,"view":"live; concurrent revisions may change ordering; deduplicate by id+revision"})
 }

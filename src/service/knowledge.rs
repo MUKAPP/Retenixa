@@ -154,15 +154,36 @@ impl Service {
         {
             return Ok(receipt);
         }
-        let conn = self.store.connect()?;
-        let access = self.access(&conn, &context, true)?;
-        let tokens = crate::search::prepare_knowledge(&conn, &access.project, &input)?;
-        drop(conn);
+        let (tokens, tags) = match &input {
+            KnowledgeWriteInput::Propose {
+                claim, search_tags, ..
+            }
+            | KnowledgeWriteInput::Revise {
+                claim, search_tags, ..
+            } => {
+                if search_tags.as_ref().is_some_and(|tags| tags.len() > 8) {
+                    return Err(DomainError::invalid("search_tags 最多 8 项"));
+                }
+                let tags = search_tags.as_ref().map(|tags| {
+                    let mut tags = tags.iter().map(|tag| tag.0.trim()).collect::<Vec<_>>();
+                    tags.sort_unstable();
+                    tags.dedup();
+                    json!(tags)
+                });
+                (Some(crate::search::tokenize(&claim.0)), tags)
+            }
+            _ => (None, None),
+        };
         self.mutate(&context,&request,"knowledge_write",payload,|tx,a|{
         if let KnowledgeWriteInput::Propose{key,scope:given_scope,claim,evidence_refs,new_evidence,..}=&input {
             let key=key.0.trim().to_lowercase();let scope=scope(tx,a,given_scope.clone())?;let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM knowledge WHERE project_id=?1 AND key=?2 AND scope_json=?3)",params![a.project,key,scope],|r|r.get(0))?;
             if exists{return Err(DomainError::new(ErrorCode::VersionConflict,"expected=absent 未命中：同 key/scope 已有知识"));}
-            let (refs,mut versions)=sources(tx,a,evidence_refs,new_evidence)?;let id=util::id();let meta=json!({"evidence_refs":refs,"source":"agent_reported","reported_by_workflow":a.workflow});
+            let (refs,mut versions)=sources(tx,a,evidence_refs,new_evidence)?;
+            let id=util::id();
+            let mut meta=json!({"evidence_refs":refs,"source":"agent_reported","reported_by_workflow":a.workflow});
+            if let Some(tags)=&tags {
+                meta["search_tags"]=tags.clone();
+            }
             tx.execute("INSERT INTO knowledge VALUES(?1,?2,?3,?4,1,'candidate')",params![a.project,id,key,scope])?;
             tx.execute("INSERT INTO knowledge_revisions VALUES(?1,?2,1,?3,?4,'candidate',?5,?6)",params![a.project,id,claim.0,util::hash(&claim.0),serde_json::to_string(&meta)?,util::now()])?;
             crate::search::insert(tx,&crate::search::knowledge_document(tx,&a.project,&id,tokens.clone())?)?;versions.push(version(&id,1));return Ok((json!({"knowledge":knowledge(tx,&a.project,&id)?,"evidence_refs":refs}),versions));
@@ -181,7 +202,17 @@ impl Service {
                 for r in &acceptance_basis.evidence_refs{validate_evidence_ref(tx,&a.project,r)?;}
                 metadata["acceptance_basis"]=util::json(acceptance_basis)?;metadata["accepted_by_workflow"]=json!(a.workflow);"active"
             },
-            KnowledgeWriteInput::Revise{claim:new,evidence_refs,new_evidence,reason,..}=>{claim=new.0.clone();let (refs,new_versions)=sources(tx,a,evidence_refs,new_evidence)?;versions.extend(new_versions);metadata=json!({"evidence_refs":refs,"reason":reason,"reported_by_workflow":a.workflow});"candidate"},
+            KnowledgeWriteInput::Revise{claim:new,evidence_refs,new_evidence,reason,..}=>{
+                claim=new.0.clone();
+                let (refs,new_versions)=sources(tx,a,evidence_refs,new_evidence)?;
+                versions.extend(new_versions);
+                let next_tags=tags.as_ref().or_else(||metadata.get("search_tags")).cloned();
+                metadata=json!({"evidence_refs":refs,"reason":reason,"reported_by_workflow":a.workflow});
+                if let Some(tags)=next_tags {
+                    metadata["search_tags"]=tags;
+                }
+                "candidate"
+            },
             KnowledgeWriteInput::Dispute{reason,..}=>{metadata["reason"]=util::json(reason)?;"disputed"},
             KnowledgeWriteInput::Retract{reason,..}=>{metadata["reason"]=util::json(reason)?;"retracted"},
             KnowledgeWriteInput::Supersede{replacement_id,replacement_expected_revision,reason,..}=>{

@@ -1,0 +1,8 @@
+/target/
+
+# Local design and milestone documents
+/G0_DECISION.md
+/IMPLEMENTATION_PLAN.md
+/docs/M0_CONTRACT.md
+/docs/M1_KERNEL.md
+/docs/M2_SEARCH.md

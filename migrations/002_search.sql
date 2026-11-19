@@ -1,0 +1,13 @@
+DROP TABLE search_fts;
+CREATE TABLE search_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE search_documents(row_id INTEGER PRIMARY KEY,project_id TEXT NOT NULL,doc_id TEXT NOT NULL,kind TEXT NOT NULL,entity_id TEXT NOT NULL,revision INTEGER NOT NULL,task_id TEXT,workspace_id TEXT,key TEXT,status TEXT NOT NULL,conditions_json TEXT NOT NULL,body_json TEXT NOT NULL,body_text TEXT NOT NULL,tokenized TEXT NOT NULL,UNIQUE(project_id,doc_id));
+CREATE TABLE search_document_paths(row_id INTEGER NOT NULL REFERENCES search_documents(row_id) ON DELETE CASCADE,path TEXT NOT NULL,PRIMARY KEY(row_id,path));
+CREATE VIRTUAL TABLE search_fts USING fts5(tokenized,content='search_documents',content_rowid='row_id',tokenize='unicode61');
+CREATE TRIGGER search_insert AFTER INSERT ON search_documents BEGIN INSERT INTO search_fts(rowid,tokenized) VALUES(new.row_id,new.tokenized); END;
+CREATE TRIGGER search_delete AFTER DELETE ON search_documents BEGIN INSERT INTO search_fts(search_fts,rowid,tokenized) VALUES('delete',old.row_id,old.tokenized); END;
+CREATE TRIGGER search_update AFTER UPDATE ON search_documents BEGIN INSERT INTO search_fts(search_fts,rowid,tokenized) VALUES('delete',old.row_id,old.tokenized);INSERT INTO search_fts(rowid,tokenized) VALUES(new.row_id,new.tokenized); END;
+CREATE INDEX search_kind_scope_idx ON search_documents(project_id,kind,workspace_id,status,doc_id);
+CREATE INDEX search_key_idx ON search_documents(project_id,key);
+CREATE INDEX search_entity_idx ON search_documents(project_id,entity_id);
+CREATE INDEX search_task_idx ON search_documents(project_id,task_id);
+CREATE INDEX search_path_idx ON search_document_paths(path,row_id);

@@ -1,0 +1,15 @@
+pub mod config;
+pub mod contracts;
+pub mod diagnostics;
+pub mod error;
+pub mod maintenance;
+pub mod mcp;
+pub mod permissions;
+pub mod project;
+pub mod project_merge;
+pub mod search;
+pub mod service;
+pub mod storage;
+pub mod util;
+mod validation;
+pub type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;

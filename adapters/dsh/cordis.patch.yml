@@ -1,0 +1,8 @@
+# Stay active so the bundle configuration form is available. The data directory
+# falls back to %LOCALAPPDATA%/Retenixa, so only the executable needs filling in.
+- insert:
+    - id: retenixa-dsh-adapter
+      name: '@retenixa/dsh-adapter'
+      disabled: false
+      config:
+        command: ''

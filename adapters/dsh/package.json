@@ -1,0 +1,35 @@
+{
+  "name": "@retenixa/dsh-adapter",
+  "version": "0.1.9",
+  "private": true,
+  "type": "module",
+  "main": "plugin.js",
+  "files": ["index.js", "plugin.js", "client.js", "cordis.patch.yml", "README.md"],
+  "exports": {".": "./plugin.js", "./client": "./client.js"},
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+  },
+  "dsh": {
+    "bundle": {"patch": "./cordis.patch.yml"},
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-settings", "@deepseek-ai/dsh-client-ui-plugin-manager"],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-agent": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-session-projection": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-working-directory": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-mcp-client": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.2.0",
+    "zod": "4.4.3"
+  }
+}

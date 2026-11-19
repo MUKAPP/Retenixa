@@ -12,6 +12,18 @@ const LITERAL_WINDOW: usize = 500;
 const LITERAL_SCAN_LIMIT: usize = 5_000;
 const NEAR_PATH: &str = "(substr(p.path,1,length(:rank_path)+1)=:rank_path||'/' OR substr(:rank_path,1,length(p.path)+1)=p.path||'/' OR p.path=:query_dir OR substr(p.path,1,length(:query_dir)+1)=:query_dir||'/')";
 const EXACT_MATCH: &str = "(d.doc_id=:query OR d.entity_id=:query OR coalesce(d.key=:query_lower,0) OR EXISTS(SELECT 1 FROM search_document_paths p WHERE p.row_id=d.row_id AND p.path=:query_path))";
+// Identical attempts have the same content and scope. Prefer an explicitly requested
+// document or checkpoint; otherwise choose a stable representative on every page.
+const ATTEMPT_REPRESENTATIVE: &str = r#"(d.attempt_hash IS NULL OR d.doc_id=:query OR d.entity_id=:query OR (
+    d.row_id=(SELECT copy.row_id FROM search_documents copy
+        WHERE copy.project_id=d.project_id AND copy.task_id=d.task_id AND copy.attempt_hash=d.attempt_hash
+        ORDER BY copy.doc_id LIMIT 1)
+    AND NOT EXISTS(SELECT 1 FROM exact_attempts x
+        WHERE x.task_id=d.task_id AND x.attempt_hash=d.attempt_hash)))"#;
+const EXACT_ATTEMPTS: &str = r#"exact_attempts AS MATERIALIZED (
+    SELECT task_id,attempt_hash FROM search_documents WHERE project_id=:project AND entity_id=:query AND attempt_hash IS NOT NULL
+    UNION SELECT task_id,attempt_hash FROM search_documents WHERE project_id=:project AND doc_id=:query AND attempt_hash IS NOT NULL
+)"#;
 struct Hit {
     id: String,
     kind: String,
@@ -82,7 +94,13 @@ fn snippet(text: &str, query: &str) -> String {
         .take(240)
         .collect()
 }
-fn render(h: &Hit, query: &str, method: &str, conditions: &[Text], path: Option<&str>) -> Value {
+fn render(
+    h: &Hit,
+    query: &str,
+    method: &'static str,
+    conditions: &[Text],
+    path: Option<&str>,
+) -> Result<SearchHit> {
     let all_conditions = h.conditions.as_array().into_iter().flatten().all(|c| {
         conditions
             .iter()
@@ -94,28 +112,71 @@ fn render(h: &Hit, query: &str, method: &str, conditions: &[Text], path: Option<
                 .iter()
                 .any(|p| requested == p || requested.starts_with(&(p.clone() + "/")))
         });
-    let applicability =
-        if !all_conditions || !path_matches || (h.kind == "knowledge" && h.status != "active") {
-            "needs_review"
-        } else {
-            "match"
-        };
-    let pointer = if h.kind == "knowledge" {
-        json!({"id":h.entity,"revision":h.revision})
+    let knowledge = h.kind == "knowledge";
+    let applicability = if !all_conditions || !path_matches || (knowledge && h.status != "active") {
+        Applicability::NeedsReview
     } else {
-        json!({"id":h.entity,"attempt_index":h.body["attempt_index"]})
+        Applicability::Match
     };
-    let evidence = if h.kind == "knowledge" {
-        h.body["metadata"]["evidence_refs"].clone()
+    let entity = Identifier(h.entity.clone());
+    let revision = Revision(h.revision);
+    let (kind, full_record, evidence_refs, reference_candidate, attempt) = if knowledge {
+        let refs: Option<Vec<EvidenceReference>> =
+            serde_json::from_value(h.body["metadata"]["evidence_refs"].clone())?;
+        (
+            SearchKind::Knowledge,
+            SearchRecordPointer::Knowledge {
+                id: entity.clone(),
+                revision: revision.clone(),
+            },
+            refs.map(SearchEvidenceRefs::Knowledge),
+            Some(SearchReferenceCandidate {
+                knowledge_id: entity.clone(),
+                revision: revision.clone(),
+                content_sha256: Sha256(util::hash(h.body["claim"].as_str().unwrap_or(""))),
+                selection: "candidate_only",
+                requires_explicit_adoption: true,
+            }),
+            None,
+        )
     } else {
-        h.body["attempt"]["verification_refs"].clone()
+        let a: Attempt = serde_json::from_value(h.body["attempt"].clone())?;
+        (
+            SearchKind::Attempts,
+            SearchRecordPointer::Attempt {
+                id: entity.clone(),
+                attempt_index: serde_json::from_value(h.body["attempt_index"].clone())?,
+            },
+            Some(SearchEvidenceRefs::Attempt(a.verification_refs)),
+            None,
+            Some(SearchAttemptSummary {
+                goal: snippet(&a.goal.0, query),
+                method: snippet(&a.method.0, query),
+                result: snippet(&a.result.0, query),
+                reason: a.reason,
+                state: a.state,
+            }),
+        )
     };
-    let selection = if h.kind == "knowledge" {
-        json!({"knowledge_id":h.entity,"revision":h.revision,"content_sha256":util::hash(h.body["claim"].as_str().unwrap_or("")),"selection":"candidate_only","requires_explicit_adoption":true})
-    } else {
-        Value::Null
-    };
-    json!({"id":h.id,"kind":h.kind,"entity_id":h.entity,"revision":h.revision,"task_id":h.task,"workspace_id":h.workspace,"key":h.key,"status":h.status,"conditions":h.conditions,"paths":h.paths,"applicability":applicability,"snippet":snippet(&h.text,query),"evidence_refs":evidence,"full_record":pointer,"reference_candidate":selection,"search_method":method,"attempt":if h.kind=="attempts"{json!({"goal":snippet(h.body["attempt"]["goal"].as_str().unwrap_or(""),query),"method":snippet(h.body["attempt"]["method"].as_str().unwrap_or(""),query),"result":snippet(h.body["attempt"]["result"].as_str().unwrap_or(""),query),"reason":h.body["attempt"]["reason"],"state":h.body["attempt"]["state"]})}else{Value::Null}})
+    Ok(SearchHit {
+        id: Identifier(h.id.clone()),
+        kind,
+        entity_id: entity,
+        revision,
+        task_id: h.task.clone().map(Identifier),
+        workspace_id: h.workspace.clone().map(Identifier),
+        key: h.key.clone().map(Identifier),
+        status: h.status.clone(),
+        conditions: serde_json::from_value(h.conditions.clone())?,
+        paths: h.paths.iter().cloned().map(Text).collect(),
+        applicability,
+        snippet: snippet(&h.text, query),
+        evidence_refs,
+        full_record,
+        reference_candidate,
+        search_method: method,
+        attempt,
+    })
 }
 impl Service {
     pub(super) fn related_knowledge(
@@ -322,7 +383,7 @@ impl Service {
                 };
                 let sql = format!(
                     r#"
-                    WITH matched AS MATERIALIZED (
+                    WITH {EXACT_ATTEMPTS}, matched AS MATERIALIZED (
                         SELECT search_fts.rowid,{} AS score FROM search_fts
                         JOIN search_documents sd ON sd.row_id=search_fts.rowid
                         WHERE search_fts MATCH :match AND sd.project_id=:project
@@ -335,7 +396,7 @@ impl Service {
                     )
                     SELECT {COLUMNS} FROM candidates c JOIN search_documents d ON d.row_id=c.rowid
                         LEFT JOIN matched m ON m.rowid=c.rowid
-                    WHERE {FILTER}
+                    WHERE {FILTER} AND {ATTEMPT_REPRESENTATIVE}
                         AND (:broad=0 OR (NOT {EXACT_MATCH} AND d.row_id NOT IN (
                             SELECT rowid FROM search_fts WHERE search_fts MATCH :strict)))
                     ORDER BY (d.doc_id=:query OR d.entity_id=:query OR coalesce(d.key=:query_lower,0)) DESC,
@@ -387,7 +448,7 @@ impl Service {
                         method,
                         &input.scope.conditions,
                         requested_path.as_deref(),
-                    ));
+                    )?);
                     if let Err(e) = util::budget(
                         response(&results, candidate.as_deref(), method, 0, false),
                         input.byte_budget,
@@ -408,7 +469,7 @@ impl Service {
                 method = "literal_fallback";
             }
             let sql = format!(
-                "SELECT {LITERAL_COLUMNS} FROM search_documents d WHERE {FILTER} AND d.doc_id>:after ORDER BY d.doc_id LIMIT :window"
+                "WITH {EXACT_ATTEMPTS} SELECT {LITERAL_COLUMNS} FROM search_documents d WHERE {FILTER} AND {ATTEMPT_REPRESENTATIVE} AND d.doc_id>:after ORDER BY d.doc_id LIMIT :window"
             );
             let mut matches = Vec::new();
             let mut last_scanned = after;
@@ -418,7 +479,7 @@ impl Service {
                     ":project":a.project, ":kind":kind, ":inactive":input.scope.include_inactive,
                     ":workspace":workspace, ":task":input.scope.task_id.as_ref().map(|t|&t.0),
                     ":path":requested_path, ":conditions":conditions, ":after":last_scanned,
-                    ":window":LITERAL_WINDOW as i64 + 1,
+                    ":query":input.query, ":window":LITERAL_WINDOW as i64 + 1,
                 })?;
                 let mut window_scanned = 0;
                 while let Some(candidate) = rows.next()? {
@@ -476,7 +537,7 @@ impl Service {
                     method,
                     &input.scope.conditions,
                     requested_path.as_deref(),
-                ));
+                )?);
                 let candidate = if index + 1 < matches.len() {
                     Some(page_cursor("literal", 0, id)?)
                 } else if capped {
@@ -504,15 +565,26 @@ impl Service {
             None,
         )?;
         tx.commit()?;
-        Ok(output)
+        util::json(&output)
     }
 }
-fn response(
-    results: &[Value],
-    cursor: Option<&str>,
-    method: &str,
+fn response<'a>(
+    results: &'a [SearchHit],
+    cursor: Option<&'a str>,
+    method: &'static str,
     scanned: usize,
     capped: bool,
-) -> Value {
-    json!({"results":results,"has_more":cursor.is_some(),"next_cursor":cursor,"omitted_categories":[],"search_method":method,"literal_scan_count":scanned,"literal_scan_limit":LITERAL_SCAN_LIMIT,"scan_limit_reached":capped,"tokenizer_version":search::TOKENIZER_VERSION,"view":"live; concurrent revisions may change ordering; deduplicate by id+revision"})
+) -> MemorySearchOutput<'a> {
+    MemorySearchOutput {
+        results,
+        has_more: cursor.is_some(),
+        next_cursor: cursor,
+        omitted_categories: Vec::new(),
+        search_method: method,
+        literal_scan_count: scanned,
+        literal_scan_limit: LITERAL_SCAN_LIMIT,
+        scan_limit_reached: capped,
+        tokenizer_version: search::TOKENIZER_VERSION,
+        view: "live; concurrent revisions may change ordering; deduplicate by id+revision",
+    }
 }

@@ -3,9 +3,12 @@ use jieba_rs::Jieba;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, sync::LazyLock};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::LazyLock,
+};
 pub const TOKENIZER_VERSION: &str = "jieba-rs-0.11.0-default-search-hmm0-ident-fields-v2";
-pub const RANKING_VERSION: &str = "strict-path-weights-v1";
+pub const RANKING_VERSION: &str = "strict-path-weights-attempt-dedup-v2";
 /// FTS columns: body, key, conditions, tags.
 pub const BM25: &str = "bm25(search_fts, 1.0, 8.0, 4.0, 2.0)";
 static JIEBA: LazyLock<Jieba> = LazyLock::new(Jieba::new);
@@ -176,6 +179,7 @@ pub struct Document {
     pub body: Value,
     pub text: String,
     pub paths: Vec<String>,
+    attempt_hash: Option<String>,
     tokens: [String; 4],
 }
 fn terms_for_values(values: &Value) -> String {
@@ -229,6 +233,7 @@ pub fn knowledge_document(
             .as_str()
             .map(|p| vec![p.into()])
             .unwrap_or_default(),
+        attempt_hash: None,
         tokens: Default::default(),
     };
     if body_tokens.is_some() {
@@ -262,6 +267,14 @@ fn unindexed_attempt_documents(
     revision: i64,
     snapshot: &CheckpointSnapshot,
 ) -> Result<Vec<Document>> {
+    let workspace = &snapshot.workspace.workspace_id.0;
+    let paths: BTreeSet<_> = snapshot
+        .workspace
+        .related_files
+        .iter()
+        .map(|p| p.path.0.replace('\\', "/"))
+        .collect();
+    let mut occurrences = HashMap::new();
     snapshot
         .attempts
         .iter()
@@ -275,6 +288,10 @@ fn unindexed_attempt_documents(
                 Observed::Unknown { reason } => &reason.0,
             };
             let text = format!("{} {} {} {}", a.goal.0, a.method.0, a.result.0, reason);
+            let fingerprint = util::hash(serde_json::to_vec(&(a, workspace, &paths))?);
+            let occurrence = occurrences.entry(fingerprint.clone()).or_insert(0usize);
+            let attempt_hash = format!("{fingerprint}:{occurrence}");
+            *occurrence += 1;
             Ok(Document {
                 project: project.into(),
                 id: format!("{checkpoint}:attempt:{i}"),
@@ -282,7 +299,7 @@ fn unindexed_attempt_documents(
                 entity: checkpoint.into(),
                 revision,
                 task: Some(task.into()),
-                workspace: Some(snapshot.workspace.workspace_id.0.clone()),
+                workspace: Some(workspace.clone()),
                 key: None,
                 status: if matches!(a.state, ExecutionState::Failed) {
                     "failed"
@@ -293,12 +310,8 @@ fn unindexed_attempt_documents(
                 conditions: util::json(&a.conditions)?,
                 body,
                 text,
-                paths: snapshot
-                    .workspace
-                    .related_files
-                    .iter()
-                    .map(|p| p.path.0.replace('\\', "/"))
-                    .collect(),
+                paths: paths.iter().cloned().collect(),
+                attempt_hash: Some(attempt_hash),
                 tokens: Default::default(),
             })
         })
@@ -309,7 +322,7 @@ pub fn insert(conn: &Connection, d: &Document) -> Result<()> {
         "DELETE FROM search_documents WHERE project_id=?1 AND doc_id=?2",
         params![d.project, d.id],
     )?;
-    conn.execute("INSERT INTO search_documents(project_id,doc_id,kind,entity_id,revision,task_id,workspace_id,key,status,conditions_json,body_json,body_text,tokenized,key_tokens,condition_tokens,tag_tokens) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![d.project,d.id,d.kind,d.entity,d.revision,d.task,d.workspace,d.key,d.status,serde_json::to_string(&d.conditions)?,serde_json::to_string(&d.body)?,d.text,d.tokens[0],d.tokens[1],d.tokens[2],d.tokens[3]])?;
+    conn.execute("INSERT INTO search_documents(project_id,doc_id,kind,entity_id,revision,task_id,workspace_id,key,status,conditions_json,body_json,body_text,tokenized,key_tokens,condition_tokens,tag_tokens,attempt_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",params![d.project,d.id,d.kind,d.entity,d.revision,d.task,d.workspace,d.key,d.status,serde_json::to_string(&d.conditions)?,serde_json::to_string(&d.body)?,d.text,d.tokens[0],d.tokens[1],d.tokens[2],d.tokens[3],d.attempt_hash])?;
     let row = conn.last_insert_rowid();
     for p in &d.paths {
         conn.execute(
@@ -366,14 +379,7 @@ pub fn rebuild(root: &crate::storage::Store, force: bool) -> Result<()> {
     crate::storage::configure(&conn)?;
     let tx = conn.transaction()?;
     crate::storage::assert_schema(&tx)?;
-    let old: Option<String> = tx
-        .query_row(
-            "SELECT value FROM search_meta WHERE key='tokenizer_version'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if !force && old.as_deref() == Some(TOKENIZER_VERSION) {
+    if !force && index_current(&tx)? {
         return Ok(());
     }
     let mut docs = Vec::new();
@@ -385,7 +391,7 @@ pub fn rebuild(root: &crate::storage::Store, force: bool) -> Result<()> {
             let key = row[3].as_str().unwrap();
             let claim = row[7].as_str().unwrap();
             let text = format!("{key} {claim}");
-            docs.push(Document{project:project.into(),id:id.into(),kind:"knowledge".into(),entity:id.into(),revision:row[5].as_i64().unwrap(),task:None,workspace:scope["workspace_id"].as_str().map(str::to_owned),key:Some(key.into()),status:row[6].as_str().unwrap().into(),conditions:scope["conditions"].clone(),body:json!({"knowledge_id":id,"claim":claim,"scope":scope,"status":row[6],"metadata":serde_json::from_str::<Value>(row[8].as_str().unwrap())?}),tokens:Default::default(),text,paths:scope["path_prefix"].as_str().map(|p|vec![p.into()]).unwrap_or_default()});
+            docs.push(Document{project:project.into(),id:id.into(),kind:"knowledge".into(),entity:id.into(),revision:row[5].as_i64().unwrap(),task:None,workspace:scope["workspace_id"].as_str().map(str::to_owned),key:Some(key.into()),status:row[6].as_str().unwrap().into(),conditions:scope["conditions"].clone(),body:json!({"knowledge_id":id,"claim":claim,"scope":scope,"status":row[6],"metadata":serde_json::from_str::<Value>(row[8].as_str().unwrap())?}),tokens:Default::default(),text,paths:scope["path_prefix"].as_str().map(|p|vec![p.into()]).unwrap_or_default(),attempt_hash:None});
         } else {
             let snapshot: CheckpointSnapshot = serde_json::from_str(row[5].as_str().unwrap())?;
             docs.extend(unindexed_attempt_documents(
@@ -404,6 +410,9 @@ pub fn rebuild(root: &crate::storage::Store, force: bool) -> Result<()> {
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     crate::storage::assert_schema(&tx)?;
+    if !force && index_current(&tx)? {
+        return Ok(());
+    }
     if source_manifest(&tx, |_| Ok(()))? != manifest {
         return Err(DomainError::storage(
             "索引重建期间权威版本变化；此次未替换索引，请稍后重新执行",
@@ -417,7 +426,7 @@ pub fn rebuild(root: &crate::storage::Store, force: bool) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
-pub fn assert_index(conn: &Connection) -> Result<()> {
+fn index_current(conn: &Connection) -> Result<bool> {
     let version: Option<String> = conn
         .query_row(
             "SELECT value FROM search_meta WHERE key='tokenizer_version'",
@@ -425,7 +434,11 @@ pub fn assert_index(conn: &Connection) -> Result<()> {
             |r| r.get(0),
         )
         .optional()?;
-    if version.as_deref() != Some(TOKENIZER_VERSION) {
+    Ok(version.as_deref() == Some(TOKENIZER_VERSION))
+}
+
+pub fn assert_index(conn: &Connection) -> Result<()> {
+    if !index_current(conn)? {
         return Err(DomainError::new(
             ErrorCode::SchemaUnsupported,
             "tokenizer 版本变化，需要完成派生索引重建后再写入",

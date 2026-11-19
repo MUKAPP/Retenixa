@@ -398,7 +398,11 @@ impl Service {
             } else {
                 None
             };
-            let page = json!({"records":records,"has_more":more,"next_cursor":next});
+            let page = MemoryGetOutput {
+                records: &records,
+                has_more: more,
+                next_cursor: next.as_deref(),
+            };
             if let Err(e) = util::budget(&page, input.byte_budget, Some(input.ids[at].0.clone())) {
                 records.pop();
                 if records.is_empty() {
@@ -406,22 +410,30 @@ impl Service {
                 }
                 let next = util::cursor(&json!({"filter":filter,"offset":at}))?;
                 let out = util::budget(
-                    json!({"records":records,"has_more":true,"next_cursor":next}),
+                    MemoryGetOutput {
+                        records: &records,
+                        has_more: true,
+                        next_cursor: Some(&next),
+                    },
                     input.byte_budget,
                     Some(input.ids[at].0.clone()),
                 )?;
                 tx.commit()?;
-                return Ok(out);
+                return util::json(&out);
             }
             at += 1;
         }
         let out = util::budget(
-            json!({"records":records,"has_more":false,"next_cursor":null}),
+            MemoryGetOutput {
+                records: &records,
+                has_more: false,
+                next_cursor: None,
+            },
             input.byte_budget,
             None,
         )?;
         tx.commit()?;
-        Ok(out)
+        util::json(&out)
     }
 }
 fn fit_resume(
@@ -632,14 +644,43 @@ fn ref_rows<T: serde::de::DeserializeOwned>(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     rows.iter().map(|r| Ok(serde_json::from_str(r)?)).collect()
 }
+fn availability(body: &Option<String>) -> RecordAvailability {
+    if body.is_some() {
+        RecordAvailability::Available
+    } else {
+        RecordAvailability::Purged
+    }
+}
+
 fn memory_record(
     conn: &Connection,
     project: &str,
     id: &str,
     revision: Option<i64>,
-) -> Result<Value> {
-    if let Some((r,claim,hash,status,meta))=conn.query_row("SELECT v.revision,v.claim,v.content_hash,v.status,v.metadata_json FROM knowledge_revisions v JOIN knowledge k ON v.project_id=k.project_id AND v.id=k.id WHERE v.project_id=?1 AND v.id=?2 AND v.revision=coalesce(?3,k.current_revision)",params![project,id,revision],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()?{return Ok(json!({"kind":"knowledge","id":id,"revision":r,"availability":if claim.is_some(){"available"}else{"purged"},"claim":claim,"content_sha256":hash,"status":status,"metadata":serde_json::from_str::<Value>(&meta)?}));}
-    if let Some((source,observation))=conn.query_row("SELECT source_json,observation FROM evidence WHERE project_id=?1 AND id=?2 AND revision=coalesce(?3,1)",params![project,id,revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).optional()?{return Ok(json!({"kind":"evidence","id":id,"availability":if observation.is_some(){"available"}else{"purged"},"source":serde_json::from_str::<Value>(&source)?,"observation":observation}));}
-    if let Some((raw,sequence,task_id,observed))=conn.query_row("SELECT snapshot_json,sequence,task_id,service_observation_json FROM checkpoints WHERE project_id=?1 AND id=?2 AND (?3 IS NULL OR sequence=?3)",params![project,id,revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?{return Ok(json!({"kind":"checkpoint","id":id,"sequence":sequence,"task_id":task_id,"snapshot":serde_json::from_str::<Value>(&raw)?,"service_workspace_observation":serde_json::from_str::<Value>(&observed)?,"knowledge_refs":ref_rows::<KnowledgeReference>(conn,"checkpoint_knowledge_refs",project,id)?,"evidence_refs":ref_rows::<EvidenceReference>(conn,"checkpoint_evidence_refs",project,id)?}));}
-    Ok(json!({"id":id,"availability":"missing"}))
+) -> Result<MemoryRecord> {
+    if let Some((r,claim,hash,status,meta))=conn.query_row("SELECT v.revision,v.claim,v.content_hash,v.status,v.metadata_json FROM knowledge_revisions v JOIN knowledge k ON v.project_id=k.project_id AND v.id=k.id WHERE v.project_id=?1 AND v.id=?2 AND v.revision=coalesce(?3,k.current_revision)",params![project,id,revision],|r|Ok((r.get(0)?,r.get::<_,Option<String>>(1)?,r.get(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()? {
+        return Ok(MemoryRecord::Found(FoundMemoryRecord::Knowledge {
+            id: Identifier(id.into()), revision: Revision(r), availability: availability(&claim),
+            claim: claim.map(Text), content_sha256: Sha256(hash),
+            status: serde_json::from_value(Value::String(status))?, metadata: serde_json::from_str(&meta)?,
+        }));
+    }
+    if let Some((source,observation))=conn.query_row("SELECT source_json,observation FROM evidence WHERE project_id=?1 AND id=?2 AND revision=coalesce(?3,1)",params![project,id,revision],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).optional()? {
+        return Ok(MemoryRecord::Found(FoundMemoryRecord::Evidence {
+            id: Identifier(id.into()), availability: availability(&observation),
+            source: serde_json::from_str(&source)?, observation: observation.map(Text),
+        }));
+    }
+    if let Some((raw,sequence,task_id,observed))=conn.query_row("SELECT snapshot_json,sequence,task_id,service_observation_json FROM checkpoints WHERE project_id=?1 AND id=?2 AND (?3 IS NULL OR sequence=?3)",params![project,id,revision],|r|Ok((r.get::<_,String>(0)?,r.get(1)?,r.get(2)?,r.get::<_,String>(3)?))).optional()? {
+        return Ok(MemoryRecord::Found(FoundMemoryRecord::Checkpoint {
+            id: Identifier(id.into()), sequence: Revision(sequence), task_id: Identifier(task_id),
+            snapshot: serde_json::from_str(&raw)?, service_workspace_observation: serde_json::from_str(&observed)?,
+            knowledge_refs: ref_rows(conn, "checkpoint_knowledge_refs", project, id)?,
+            evidence_refs: ref_rows(conn, "checkpoint_evidence_refs", project, id)?,
+        }));
+    }
+    Ok(MemoryRecord::Missing {
+        id: Identifier(id.into()),
+        availability: RecordAvailability::Missing,
+    })
 }

@@ -149,9 +149,8 @@ impl Service {
         let payload = util::json(&input)?;
         let context = util::text(&payload, "context_id");
         let request = util::text(&payload, "request_id");
-        if let Some(receipt) =
-            self.try_replay(&context, &request, "knowledge_write", payload.clone())?
-        {
+        let (_, replay) = self.preflight(&context, &request, "knowledge_write", &payload)?;
+        if let Some(receipt) = replay {
             return Ok(receipt);
         }
         let (tokens, tags) = match &input {

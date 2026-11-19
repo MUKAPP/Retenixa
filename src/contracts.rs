@@ -328,6 +328,79 @@ pub struct MemorySearchInput {
     pub byte_budget: u32,
 }
 
+#[derive(Serialize, JsonSchema)]
+pub struct MemorySearchOutput<'a> {
+    pub results: &'a [SearchHit],
+    pub has_more: bool,
+    pub next_cursor: Option<&'a str>,
+    pub omitted_categories: Vec<Text>,
+    pub search_method: &'a str,
+    pub literal_scan_count: usize,
+    pub literal_scan_limit: usize,
+    pub scan_limit_reached: bool,
+    pub tokenizer_version: &'a str,
+    pub view: &'a str,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SearchHit {
+    pub id: Identifier,
+    pub kind: SearchKind,
+    pub entity_id: Identifier,
+    pub revision: Revision,
+    pub task_id: Option<Identifier>,
+    pub workspace_id: Option<Identifier>,
+    pub key: Option<Identifier>,
+    pub status: String,
+    pub conditions: Vec<Text>,
+    pub paths: Vec<Text>,
+    pub applicability: Applicability,
+    pub snippet: String,
+    pub evidence_refs: Option<SearchEvidenceRefs>,
+    pub full_record: SearchRecordPointer,
+    pub reference_candidate: Option<SearchReferenceCandidate>,
+    pub search_method: &'static str,
+    pub attempt: Option<SearchAttemptSummary>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum SearchRecordPointer {
+    Knowledge {
+        id: Identifier,
+        revision: Revision,
+    },
+    Attempt {
+        id: Identifier,
+        attempt_index: usize,
+    },
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum SearchEvidenceRefs {
+    Knowledge(Vec<EvidenceReference>),
+    Attempt(Vec<Identifier>),
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SearchReferenceCandidate {
+    pub knowledge_id: Identifier,
+    pub revision: Revision,
+    pub content_sha256: Sha256,
+    pub selection: &'static str,
+    pub requires_explicit_adoption: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SearchAttemptSummary {
+    pub goal: String,
+    pub method: String,
+    pub result: String,
+    pub reason: Observed<Text>,
+    pub state: ExecutionState,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryGetInput {
@@ -339,6 +412,60 @@ pub struct MemoryGetInput {
     pub cursor: Option<String>,
     #[schemars(range(min = 1, max = 4194304))]
     pub byte_budget: u32,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct MemoryGetOutput<'a> {
+    pub records: &'a [MemoryRecord],
+    pub has_more: bool,
+    pub next_cursor: Option<&'a str>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordAvailability {
+    Available,
+    Purged,
+    Missing,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum MemoryRecord {
+    Found(FoundMemoryRecord),
+    Missing {
+        id: Identifier,
+        availability: RecordAvailability,
+    },
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FoundMemoryRecord {
+    Knowledge {
+        id: Identifier,
+        revision: Revision,
+        availability: RecordAvailability,
+        claim: Option<Text>,
+        content_sha256: Sha256,
+        status: KnowledgeStatus,
+        metadata: Value,
+    },
+    Evidence {
+        id: Identifier,
+        availability: RecordAvailability,
+        source: FixedEvidence,
+        observation: Option<Text>,
+    },
+    Checkpoint {
+        id: Identifier,
+        sequence: Revision,
+        task_id: Identifier,
+        snapshot: Box<CheckpointSnapshot>,
+        service_workspace_observation: Box<WorkspaceObservation>,
+        knowledge_refs: Vec<KnowledgeReference>,
+        evidence_refs: Vec<EvidenceReference>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -385,6 +512,26 @@ pub struct TaskListInput {
     pub cursor: Option<String>,
     #[schemars(range(min = 1, max = 100))]
     pub limit: u32,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TaskSummary {
+    pub task_id: Identifier,
+    pub revision: Revision,
+    pub ownership_epoch: Revision,
+    pub owner_workflow_id: Option<Identifier>,
+    pub status: TaskStatus,
+    pub goal: Text,
+    pub scope: Text,
+    pub parent_task_id: Option<Identifier>,
+    pub latest_checkpoint_id: Option<Identifier>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TaskListOutput {
+    pub tasks: Vec<TaskSummary>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

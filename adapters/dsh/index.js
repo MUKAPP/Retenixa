@@ -35,11 +35,38 @@ function cleanedEnv(extra={}) {
 async function projectKeys(workspace, dataDir) {
   const cwd=await fs.realpath(workspace);
   const env=cleanedEnv();for(const key of ['GIT_DIR','GIT_COMMON_DIR','GIT_WORK_TREE','GIT_INDEX_FILE'])delete env[key];
-  let location,mainRoot;
-  try {const result=await runFile('git',['-C',cwd,'rev-parse','--path-format=absolute','--git-common-dir'],{env,windowsHide:true});const common=await fs.realpath(result.stdout.trim());location='git:'+common;if(path.basename(common)==='.git')mainRoot=await fs.realpath(path.dirname(common));}
-  catch(error) {if(error.code==='ENOENT')throw error;location='path:'+cwd;}
+  let root, location, mainRoot, bareLocation;
+  try {
+    const top=await runFile('git',['-C',cwd,'rev-parse','--show-toplevel'],{env,windowsHide:true});
+    root=top.stdout.trim();
+  } catch(error) {
+    if(typeof error.code!=='number')throw error;
+    for(let ancestor=cwd;;ancestor=path.dirname(ancestor)) {
+      const marker=await fs.lstat(path.join(ancestor,'.git')).catch(error=>{
+        if(error.code!=='ENOENT')throw error;
+        return null;
+      });
+      if(marker)throw new Error('Retenixa Git 现场不可读，不能静默重新登记为非 Git 项目',{cause:error});
+      if(path.dirname(ancestor)===ancestor)break;
+    }
+  }
+  if(root===undefined) {
+    location='path:'+cwd;
+    // Older adapters keyed bare repositories by their Git common directory.
+    const bare=await runFile('git',['-C',cwd,'rev-parse','--is-bare-repository','--path-format=absolute','--git-common-dir'],{env,windowsHide:true}).catch(error=>{
+      if(typeof error.code!=='number')throw error;
+      return null;
+    });
+    const [isBare, common]=bare?.stdout.trim().split(/\r?\n/)??[];
+    if(isBare==='true'&&common)bareLocation='git:'+await fs.realpath(common);
+  } else {
+    const result=await runFile('git',['-C',await fs.realpath(root),'rev-parse','--path-format=absolute','--git-common-dir'],{env,windowsHide:true});
+    const common=await fs.realpath(result.stdout.trim());
+    location='git:'+common;
+    if(path.basename(common)==='.git')mainRoot=await fs.realpath(path.dirname(common));
+  }
   const key=identity=>hash(JSON.stringify([path.resolve(dataDir),identity]));
-  return {key:key(location),legacyKey:mainRoot?key('path:'+mainRoot):null,mainRoot};
+  return {key:key(location),legacyKey:mainRoot?key('path:'+mainRoot):null,bareKey:bareLocation?key(bareLocation):null,mainRoot};
 }
 function publicInput(tool) {
   const schema=copy(tool.inputSchema);
@@ -140,6 +167,8 @@ export async function install(ctx,config,requireHost=createRequire(import.meta.u
     const keys=await projectKeys(workspace,config.dataDir);
     const sessionKey=key=>hash(JSON.stringify([key,sessionId]));
     const primary=sessionKey(keys.key),legacy=keys.legacyKey?sessionKey(keys.legacyKey):null;
+    const bare=keys.bareKey?sessionKey(keys.bareKey):null;
+    if(bare&&bindings.get(bare)&&!bindings.get(primary))return bare;
     // 同一目录初始化 Git 后沿用已附着的能力及待确认请求；已有 Git 工作流仍可在 worktree 中续接。
     if(legacy&&bindings.get(legacy)&&(workspace===keys.mainRoot||!bindings.get(primary)?.lastContext))return legacy;
     return primary;

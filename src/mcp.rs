@@ -31,12 +31,12 @@ impl RetenixaServer {
     fn contract_get(&self) -> Json<ContractCatalog> {
         Json(crate::contracts::catalog())
     }
-    #[tool(description="检查真实 SQLite/FTS5/schema、完整性、当前代次及固定引用缺口，不输出记忆正文",output_schema=rmcp::handler::server::tool::schema_for_output::<serde_json::Map<String,serde_json::Value>>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
+    #[tool(description="检查真实 SQLite/FTS5/schema、完整性、当前代次及固定引用缺口，不输出记忆正文",output_schema=rmcp::handler::server::tool::schema_for_output::<crate::maintenance::DoctorOutput>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
     async fn system_doctor(&self) -> CallToolResult {
         let root = self.service.store.root.clone();
         finish(tokio::task::spawn_blocking(move || crate::maintenance::doctor(&root)).await)
     }
-    #[tool(description="按当前项目、工作区、任务、路径和条件检索知识及失败尝试；文本查询不执行 FTS 表达式，结果需明确采用才能成为固定依据",output_schema=rmcp::handler::server::tool::schema_for_output::<serde_json::Map<String,serde_json::Value>>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
+    #[tool(description="按当前项目、工作区、任务、路径和条件检索知识及失败尝试；文本查询不执行 FTS 表达式，结果需明确采用才能成为固定依据",output_schema=rmcp::handler::server::tool::schema_for_output::<MemorySearchOutput<'static>>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
     async fn memory_search(
         &self,
         Parameters(input): Parameters<MemorySearchInput>,
@@ -118,14 +118,14 @@ impl RetenixaServer {
             Err(error) => failure(error),
         }
     }
-    #[tool(description="精确读取当前项目的历史记录、来源与快照；显式返回 missing/purged",output_schema=rmcp::handler::server::tool::schema_for_output::<serde_json::Map<String,serde_json::Value>>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
+    #[tool(description="精确读取当前项目的历史记录、来源与快照；显式返回 missing/purged",output_schema=rmcp::handler::server::tool::schema_for_output::<MemoryGetOutput<'static>>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
     async fn memory_get(&self, Parameters(input): Parameters<MemoryGetInput>) -> CallToolResult {
         match util::json(&input) {
             Ok(value) => self.dispatch("memory_get", value).await,
             Err(error) => failure(error),
         }
     }
-    #[tool(description="按稳定任务 ID 返回当前项目索引与绑定查询的分页游标",output_schema=rmcp::handler::server::tool::schema_for_output::<serde_json::Map<String,serde_json::Value>>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
+    #[tool(description="按稳定任务 ID 返回当前项目索引与绑定查询的分页游标",output_schema=rmcp::handler::server::tool::schema_for_output::<TaskListOutput>(),annotations(read_only_hint=true,destructive_hint=false,idempotent_hint=true,open_world_hint=false))]
     async fn task_list(&self, Parameters(input): Parameters<TaskListInput>) -> CallToolResult {
         match util::json(&input) {
             Ok(value) => self.dispatch("task_list", value).await,
@@ -166,7 +166,6 @@ fn failure(error: DomainError) -> CallToolResult {
 }
 #[tool_handler(
     name = "retenixa",
-    version = "0.1.0",
     instructions = "跟踪或接续任务 → context_open；纯只读问答或无需接续的小改动，不建任务、不存检查点。context_resume 只读。归属冲突 → 停止写入，列出交接信息，请用户决定，勿静默另建。未知写入 → 查原 request_id；未知外部操作 → 查原宿主，勿重跑。"
 )]
 impl ServerHandler for RetenixaServer {}

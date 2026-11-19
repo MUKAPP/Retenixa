@@ -119,13 +119,41 @@ pub fn restore(root: &Path, source_path: &Path) -> Result<Value> {
         json!({"restored_from":source_path,"pre_restore_backup":previous,"schema_version":restored_version,"integrity":"ok","reconnect_required":true}),
     )
 }
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct DoctorOutput {
+    #[serde(flatten)]
+    engine: crate::diagnostics::EngineReport,
+    #[serde(flatten)]
+    database: Option<DatabaseReport>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct DatabaseReport {
+    schema_version: i64,
+    integrity: &'static str,
+    journal_mode: String,
+    workflows: Vec<WorkflowReport>,
+    reference_gaps: i64,
+    tokenizer_version: Option<String>,
+    index_compatible: bool,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct WorkflowReport {
+    project_id: String,
+    workflow_id: String,
+    writer_generation: i64,
+}
+
 pub fn doctor(root: &Path) -> Result<Value> {
-    let engine = crate::diagnostics::inspect(root.to_path_buf())
+    let mut engine = crate::diagnostics::inspect(root.to_path_buf())
         .map_err(|e| DomainError::new(ErrorCode::StorageFailure, e.to_string()))?;
-    let mut out = util::json(&engine)?;
     let path = root.join("retenixa.sqlite3");
     if !path.is_file() {
-        return Ok(out);
+        return util::json(&DoctorOutput {
+            engine,
+            database: None,
+        });
     }
     let gate = OpenOptions::new()
         .read(true)
@@ -138,28 +166,41 @@ pub fn doctor(root: &Path) -> Result<Value> {
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.execute_batch("BEGIN")?;
     verify(&conn)?;
-    out["persistent_database_initialized"] = json!(true);
-    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    out["schema_version"] = json!(version);
-    out["integrity"] = json!("ok");
-    let journal: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
-    out["journal_mode"] = json!(journal);
+    engine.persistent_database_initialized = true;
+    let schema_version = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let journal_mode = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
     let mut stmt =
         conn.prepare("SELECT project_id,id,generation FROM workflows ORDER BY project_id,id")?;
-    let generations=stmt.query_map([],|r|Ok(json!({"project_id":r.get::<_,String>(0)?,"workflow_id":r.get::<_,String>(1)?,"writer_generation":r.get::<_,i64>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-    out["workflows"] = json!(generations);
-    let gaps:i64=conn.query_row("SELECT (SELECT count(*) FROM checkpoint_knowledge_refs r LEFT JOIN knowledge_revisions k ON r.project_id=k.project_id AND r.object_id=k.id AND r.revision=k.revision WHERE k.claim IS NULL)+(SELECT count(*) FROM checkpoint_evidence_refs r LEFT JOIN evidence e ON r.project_id=e.project_id AND r.object_id=e.id AND r.revision=e.revision WHERE e.observation IS NULL)",[],|r|r.get(0))?;
-    out["reference_gaps"] = json!(gaps);
-    let indexed: Option<String> = conn
+    let workflows = stmt
+        .query_map([], |r| {
+            Ok(WorkflowReport {
+                project_id: r.get(0)?,
+                workflow_id: r.get(1)?,
+                writer_generation: r.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let reference_gaps = conn.query_row("SELECT (SELECT count(*) FROM checkpoint_knowledge_refs r LEFT JOIN knowledge_revisions k ON r.project_id=k.project_id AND r.object_id=k.id AND r.revision=k.revision WHERE k.claim IS NULL)+(SELECT count(*) FROM checkpoint_evidence_refs r LEFT JOIN evidence e ON r.project_id=e.project_id AND r.object_id=e.id AND r.revision=e.revision WHERE e.observation IS NULL)",[],|r|r.get(0))?;
+    let tokenizer_version: Option<String> = conn
         .query_row(
             "SELECT value FROM search_meta WHERE key='tokenizer_version'",
             [],
             |r| r.get(0),
         )
         .optional()?;
-    out["tokenizer_version"] = json!(indexed);
-    out["index_compatible"] = json!(indexed.as_deref() == Some(crate::search::TOKENIZER_VERSION));
-    Ok(out)
+    let index_compatible = tokenizer_version.as_deref() == Some(crate::search::TOKENIZER_VERSION);
+    util::json(&DoctorOutput {
+        engine,
+        database: Some(DatabaseReport {
+            schema_version,
+            integrity: "ok",
+            journal_mode,
+            workflows,
+            reference_gaps,
+            tokenizer_version,
+            index_compatible,
+        }),
+    })
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

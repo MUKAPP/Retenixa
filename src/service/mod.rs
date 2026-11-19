@@ -110,8 +110,16 @@ impl Service {
         }
         let (result, versions) = write(&tx, &a)?;
         let at = util::now();
-        for v in &versions {
-            tx.execute("INSERT INTO events(project_id,entity_id,revision,actor,request_id,kind,data_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![a.project,v.entity_id.0,v.revision.0,a.workflow,request,op,serde_json::to_string(&result)?,at])?;
+        if let Some((primary, others)) = versions.split_last() {
+            let event_payload = serde_json::to_string(&result)?;
+            let pointer = serde_json::to_string(&json!({"result_event":primary}))?;
+            for (v, data) in others
+                .iter()
+                .map(|v| (v, &pointer))
+                .chain([(primary, &event_payload)])
+            {
+                tx.execute("INSERT INTO events(project_id,entity_id,revision,actor,request_id,kind,data_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![a.project,v.entity_id.0,v.revision.0,a.workflow,request,op,data,at])?;
+            }
         }
         let receipt = json!({"status":"committed","request_id":request,"committed_at":at,"committed_versions":versions,"result":result,"replayed":false});
         tx.execute(
@@ -129,22 +137,23 @@ impl Service {
         tx.commit()?;
         Ok(receipt)
     }
-    fn try_replay(
+    fn preflight(
         &self,
         context: &str,
         request: &str,
         op: &str,
-        mut payload: Value,
-    ) -> Result<Option<Value>> {
-        if let Some(o) = payload.as_object_mut() {
-            o.remove("context_id");
-            o.remove("request_id");
-        }
+        payload: &Value,
+    ) -> Result<(Access, Option<Value>)> {
         let mut conn = self.store.connect()?;
         let tx = conn.transaction()?;
         let a = self.access(&tx, context, true)?;
         let row=tx.query_row("SELECT payload_hash,result_json,hash_project_id FROM request_dedup WHERE project_id=?1 AND workflow_id=?2 AND request_id=?3",params![a.project,a.workflow,request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?))).optional()?;
         let result = if let Some((h, body, origin)) = row {
+            let mut payload = payload.clone();
+            if let Some(o) = payload.as_object_mut() {
+                o.remove("context_id");
+                o.remove("request_id");
+            }
             let hash = util::hash(util::canonical(
                 &json!({"schema_version":1,"op":op,"project_id":origin.as_deref().unwrap_or(&a.project),"workflow_id":a.workflow,"payload":payload}),
             )?);
@@ -165,7 +174,7 @@ impl Service {
             None
         };
         tx.commit()?;
-        Ok(result)
+        Ok((a, result))
     }
     fn request_get(&self, input: RequestGetInput) -> Result<Value> {
         let mut db = self.store.connect()?;
@@ -188,8 +197,36 @@ fn version(id: &str, n: i64) -> EntityVersion {
         revision: Revision(n),
     }
 }
+const TASK_COLUMNS: &str = "t.id,t.revision,t.ownership_epoch,t.owner_workflow_id,t.status,t.goal,t.scope,t.parent_task_id,t.latest_checkpoint_id";
+
+fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummary> {
+    let status: String = r.get(4)?;
+    let status = serde_json::from_value(Value::String(status)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(TaskSummary {
+        task_id: Identifier(r.get(0)?),
+        revision: Revision(r.get(1)?),
+        ownership_epoch: Revision(r.get(2)?),
+        owner_workflow_id: r.get::<_, Option<String>>(3)?.map(Identifier),
+        status,
+        goal: Text(r.get(5)?),
+        scope: Text(r.get(6)?),
+        parent_task_id: r.get::<_, Option<String>>(7)?.map(Identifier),
+        latest_checkpoint_id: r.get::<_, Option<String>>(8)?.map(Identifier),
+    })
+}
+
 fn task(conn: &Connection, project: &str, id: &str) -> Result<Value> {
-    conn.query_row("SELECT revision,ownership_epoch,owner_workflow_id,status,goal,scope,parent_task_id,latest_checkpoint_id FROM tasks WHERE project_id=?1 AND id=?2",params![project,id],|r|Ok(json!({"task_id":id,"revision":r.get::<_,i64>(0)?,"ownership_epoch":r.get::<_,i64>(1)?,"owner_workflow_id":r.get::<_,Option<String>>(2)?,"status":r.get::<_,String>(3)?,"goal":r.get::<_,String>(4)?,"scope":r.get::<_,String>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"latest_checkpoint_id":r.get::<_,Option<String>>(7)?}))).optional()?.ok_or_else(||DomainError::new(ErrorCode::NotFound,"当前项目不存在该任务"))
+    let task = conn
+        .query_row(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks t WHERE t.project_id=?1 AND t.id=?2"),
+            params![project, id],
+            task_row,
+        )
+        .optional()?
+        .ok_or_else(|| DomainError::new(ErrorCode::NotFound, "当前项目不存在该任务"))?;
+    util::json(&task)
 }
 fn check_task(t: &Value, a: &Access, rev: i64, epoch: i64) -> Result<()> {
     if t["ownership_epoch"].as_i64() != Some(epoch)

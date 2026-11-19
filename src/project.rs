@@ -12,6 +12,9 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_OBSERVATION_BYTES: u64 = 128 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Location {
     pub root: String,
@@ -57,7 +60,13 @@ pub fn locate(input: &str) -> Result<Location> {
             git: true,
         })
     } else {
-        if root.ancestors().any(|p| p.join(".git").exists()) {
+        if root
+            .ancestors()
+            .any(|p| match std::fs::symlink_metadata(p.join(".git")) {
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                Ok(_) => true,
+            })
+        {
             return Err(DomainError::invalid(
                 "Git 现场不可读，不能静默重新登记为非 Git 项目",
             ));
@@ -98,9 +107,9 @@ fn observation_git(root: &Path, args: &[&str], reason: &str) -> Observed<String>
         },
     }
 }
-pub fn file_observation(root: &Path, relative: &str) -> FileObservation {
+fn file_observation(root: &Path, relative: &str, remaining: &mut u64) -> FileObservation {
     let at = Timestamp(util::now());
-    let inspect = || -> Result<Observed<Sha256>> {
+    let mut inspect = || -> Result<Observed<Sha256>> {
         let path = PathBuf::from(relative);
         if path.is_absolute()
             || path
@@ -119,13 +128,31 @@ pub fn file_observation(root: &Path, relative: &str) -> FileObservation {
         if !before.is_file() {
             return Err(DomainError::invalid("只观测普通文件"));
         }
+        if before.len() > MAX_FILE_BYTES {
+            return Ok(Observed::Unknown {
+                reason: Text("文件超过单文件哈希预算（32 MiB）".into()),
+            });
+        }
+        if before.len() > *remaining {
+            return Ok(Observed::Unknown {
+                reason: Text("单次观测的文件哈希预算不足".into()),
+            });
+        }
+        // Probe one byte beyond the hash budget to distinguish EOF from a truncated read.
+        let mut reader = (&mut f).take(MAX_FILE_BYTES.min(*remaining) + 1);
         use sha2::{Digest, Sha256 as Hasher};
         let mut h = Hasher::new();
         let mut buf = [0u8; 65536];
         loop {
-            let n = f.read(&mut buf)?;
+            let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
+            }
+            *remaining = remaining.saturating_sub(n as u64);
+            if reader.limit() == 0 {
+                return Ok(Observed::Unknown {
+                    reason: Text("读取期间文件超过哈希预算".into()),
+                });
             }
             h.update(&buf[..n]);
         }
@@ -175,10 +202,11 @@ pub fn observe(root: &str, mut snapshot: WorkspaceObservation) -> Result<Workspa
         &["rev-parse", "--verify", "HEAD"],
         "非 Git 或空仓库，没有可观测 HEAD",
     );
+    let mut remaining = MAX_OBSERVATION_BYTES;
     snapshot.related_files = snapshot
         .related_files
         .iter()
-        .map(|f| file_observation(root, &f.path.0))
+        .map(|f| file_observation(root, &f.path.0, &mut remaining))
         .collect();
     snapshot.observed_at = Timestamp(util::now());
     snapshot.consistency = if snapshot

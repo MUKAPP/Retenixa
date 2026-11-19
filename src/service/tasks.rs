@@ -52,12 +52,13 @@ impl Service {
     }
     pub(super) fn save_checkpoint(&self, input: CheckpointSaveInput) -> Result<Value> {
         let payload = util::json(&input)?;
-        if let Some(receipt) = self.try_replay(
+        let (access, replay) = self.preflight(
             &input.context_id.0,
             &input.request_id.0,
             "checkpoint_save",
-            payload.clone(),
-        )? {
+            &payload,
+        )?;
+        if let Some(receipt) = replay {
             return Ok(receipt);
         }
         if input.snapshot.schema_version != 1 || input.snapshot.completion_conditions.is_empty() {
@@ -76,8 +77,6 @@ impl Service {
                 "无固定依据时必须说明 no_references_reason",
             ));
         }
-        let conn = self.store.connect()?;
-        let access = self.access(&conn, &input.context_id.0, false)?;
         if input.snapshot.workspace.workspace_id.0 != access.workspace {
             return Err(DomainError::new(
                 ErrorCode::ProjectScopeMismatch,
@@ -86,7 +85,6 @@ impl Service {
         }
         let service_observation =
             crate::project::observe(&access.root, input.snapshot.workspace.clone())?;
-        drop(conn);
         let attempt_documents = crate::search::attempt_documents(
             "",
             "",
@@ -144,8 +142,8 @@ impl Service {
             String::new()
         };
         let status = util::json(&input.status)?;
-        let mut q=conn.prepare("SELECT t.id FROM tasks t WHERE t.project_id=?1 AND t.id>?2 AND (?3 IS NULL OR t.status=?3) AND (?4 IS NULL OR t.parent_task_id=?4) AND (?5 IS NULL OR t.workspace_id=?5) ORDER BY t.id LIMIT ?6")?;
-        let ids = q
+        let mut q=conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks t WHERE t.project_id=?1 AND t.id>?2 AND (?3 IS NULL OR t.status=?3) AND (?4 IS NULL OR t.parent_task_id=?4) AND (?5 IS NULL OR t.workspace_id=?5) ORDER BY t.id LIMIT ?6"))?;
+        let mut tasks = q
             .query_map(
                 params![
                     a.project,
@@ -155,23 +153,22 @@ impl Service {
                     input.workspace_id.as_ref().map(|w| &w.0),
                     input.limit + 1
                 ],
-                |r| r.get::<_, String>(0),
+                task_row,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let more = ids.len() > input.limit as usize;
-        let visible = &ids[..ids.len().min(input.limit as usize)];
-        let values = visible
-            .iter()
-            .map(|id| task(conn, &a.project, id))
-            .collect::<Result<Vec<_>>>()?;
-        let cursor = if more {
-            Some(util::cursor(
-                &json!({"filter":filter,"after":visible.last()}),
-            )?)
+        let has_more = tasks.len() > input.limit as usize;
+        tasks.truncate(input.limit as usize);
+        let next_cursor = if has_more {
+            let after = tasks.last().map(|task| &task.task_id);
+            Some(util::cursor(&json!({"filter":filter,"after":after}))?)
         } else {
             None
         };
-        Ok(json!({"tasks":values,"has_more":more,"next_cursor":cursor}))
+        util::json(&TaskListOutput {
+            tasks,
+            has_more,
+            next_cursor,
+        })
     }
 }
 fn next(n: i64) -> Result<i64> {

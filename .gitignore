@@ -1,4 +1,5 @@
 /target/
+/adapters/dsh/node_modules/
 
 # Local design and milestone documents
 /G0_DECISION.md

@@ -17,7 +17,13 @@ DeepSeek Harness（DSH）的 Retenixa 适配插件，提供持久工作流绑定
 
 ### 2. 通过 DSH 原生方式安装插件
 
-DSH 支持通过原生 **CLI** 或 **GUI** 直接安装 `.tgz` 压缩包或本地包目录。
+DSH 支持通过原生 **CLI** 或 **GUI** 安装 `.tgz` 压缩包或本地包目录。安装 `.tgz` 时，DSH 的包管理器会安装随包声明的依赖；安装本地目录时，DSH 只链接该目录（`link:`）。选用本地目录时，先在仓库根目录运行：
+
+```bash
+npm --prefix ./adapters/dsh install --legacy-peer-deps --ignore-scripts --no-package-lock --no-audit --no-fund
+```
+
+此命令在适配器目录安装 `zod` 和 MCP Client 及其依赖；DSH 的 `peerDependencies` 由宿主提供，不在源码目录另装一份。如果目录已经链接，但插件显示启用却没有 Retenixa 工具，补装依赖后完全退出并重新打开 DSH，无需重装插件或重填配置。
 
 #### 方式一：DSH CLI 安装
 
